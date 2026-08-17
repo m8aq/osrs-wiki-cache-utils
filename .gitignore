@@ -1,9 +1,12 @@
 /target/
 /snapshots/
+/snapshot/
 /indexes/
 /model-cache/
 .DS_Store
+*.log
 *.sqlite
+*.sqlite.*
 *.sqlite-shm
 *.sqlite-wal
 *.tar.zst
