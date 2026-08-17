@@ -219,14 +219,7 @@ pub async fn build_snapshot(options: SnapshotOptions) -> Result<SnapshotMetadata
     included.sort_by(|left, right| left.title.cmp(&right.title));
     excluded.sort_by(|left, right| left.title.cmp(&right.title));
 
-    if !failures.is_empty() {
-        write_lines(&options.output.join("failures.txt"), &failures)?;
-        bail!(
-            "snapshot incomplete: {} page(s) failed; rerun to resume",
-            failures.len()
-        );
-    }
-    let _ = fs::remove_file(options.output.join("failures.txt"));
+    write_snapshot_progress(&options.output, &included, &excluded, &aliases, &failures)?;
 
     if options.titles.is_empty() {
         let current = included
@@ -239,9 +232,6 @@ pub async fn build_snapshot(options: SnapshotOptions) -> Result<SnapshotMetadata
             }
         }
     }
-    write_json_lines(&options.output.join("manifest.jsonl"), &included)?;
-    write_json_lines(&options.output.join("excluded.jsonl"), &excluded)?;
-    write_json_lines(&options.output.join("aliases.jsonl"), &aliases)?;
 
     let metadata = SnapshotMetadata {
         snapshot_date: Utc::now().format("%Y%m%d").to_string(),
@@ -261,6 +251,27 @@ pub async fn build_snapshot(options: SnapshotOptions) -> Result<SnapshotMetadata
     write_json(&options.output.join("snapshot.json"), &metadata)?;
     write_attribution(&options.output)?;
     Ok(metadata)
+}
+
+fn write_snapshot_progress(
+    output: &Path,
+    included: &[PageManifest],
+    excluded: &[ExcludedManifest],
+    aliases: &[AliasManifest],
+    failures: &[String],
+) -> Result<()> {
+    write_json_lines(&output.join("manifest.jsonl"), included)?;
+    write_json_lines(&output.join("excluded.jsonl"), excluded)?;
+    write_json_lines(&output.join("aliases.jsonl"), aliases)?;
+    if failures.is_empty() {
+        let _ = fs::remove_file(output.join("failures.txt"));
+        return Ok(());
+    }
+    write_lines(&output.join("failures.txt"), failures)?;
+    bail!(
+        "snapshot incomplete: {} page(s) failed; rerun to resume",
+        failures.len()
+    )
 }
 
 fn validate_shard(index: Option<usize>, count: Option<usize>) -> Result<Option<(usize, usize)>> {
@@ -745,6 +756,58 @@ mod tests {
         write_json_lines(&path, &values).unwrap();
         let read: Vec<AliasManifest> = read_json_lines(&path).unwrap();
         assert_eq!(read[0].target, values[0].target);
+    }
+
+    #[test]
+    fn failed_snapshot_checkpoints_successful_pages() {
+        let directory = tempfile::tempdir().unwrap();
+        let included = vec![PageManifest {
+            title: "Included".to_string(),
+            namespace: 0,
+            page_id: 1,
+            revision_id: 2,
+            revision_url: "revision".to_string(),
+            modified_at: "modified".to_string(),
+            touched_at: Some("touched".to_string()),
+            fetched_at: "fetched".to_string(),
+            categories: Vec::new(),
+            path: "pages/0/1.html".to_string(),
+            sha256: "hash".to_string(),
+        }];
+        let excluded = vec![ExcludedManifest {
+            title: "Excluded".to_string(),
+            namespace: 0,
+            page_id: 3,
+            revision_id: 4,
+            touched_at: Some("touched".to_string()),
+            categories: vec!["Historical content".to_string()],
+            reason: "Historical content".to_string(),
+        }];
+        let aliases = vec![AliasManifest {
+            alias: "Alias".to_string(),
+            target: "Included".to_string(),
+        }];
+        let failures = vec!["fetch Failed: HTTP 500".to_string()];
+
+        assert!(
+            write_snapshot_progress(directory.path(), &included, &excluded, &aliases, &failures)
+                .is_err()
+        );
+        assert_eq!(
+            read_json_lines::<PageManifest>(&directory.path().join("manifest.jsonl")).unwrap()[0]
+                .page_id,
+            1
+        );
+        assert_eq!(
+            read_json_lines::<ExcludedManifest>(&directory.path().join("excluded.jsonl")).unwrap()
+                [0]
+            .page_id,
+            3
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("failures.txt")).unwrap(),
+            failures[0]
+        );
     }
 
     #[test]

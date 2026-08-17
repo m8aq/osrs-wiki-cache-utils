@@ -202,8 +202,9 @@ cache-dump commit.
 
 ## Update and verify
 
-Rerun `snapshot` and then `index` with the same paths. Unchanged Wiki pages and
-index entries are reused. Include the cache arguments when adding or updating
+Rerun `snapshot` and then `index` with the same paths. Successful pages are
+checkpointed even if another page fails, so unchanged Wiki pages and index
+entries are reused. Include the cache arguments when adding or updating
 game-cache data.
 
 ```sh
