@@ -986,7 +986,7 @@ impl SearchEngine {
         let next_offset = (offset + results.len() < total).then_some(offset + results.len());
         let sources = results
             .iter()
-            .map(|row| self.page_source_by_id(row.page_id))
+            .map(|row| self.page_row_by_id(row.page_id).map(|page| source(&page)))
             .collect::<Result<Vec<_>>>()?;
         Ok(RankedSearch {
             results,
@@ -1274,10 +1274,6 @@ impl SearchEngine {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    fn page_source_by_id(&self, page_id: i64) -> Result<SourceRef> {
-        Ok(source(&self.page_row_by_id(page_id)?))
-    }
-
     fn provenance(&self, source_kind: &str, sources: Vec<SourceRef>) -> Provenance {
         if source_kind == "cache" {
             let cache = self.cache.as_ref();
@@ -1351,16 +1347,6 @@ pub fn verify_index(database: &Path) -> Result<()> {
         None => {}
     }
     Ok(())
-}
-
-/// Returns whether an index contains separately licensed game-cache data.
-pub fn index_has_cache(database: &Path) -> Result<bool> {
-    let connection =
-        Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    Ok(connection
-        .query_row("SELECT 1 FROM meta WHERE key = 'cache'", [], |_| Ok(()))
-        .optional()?
-        .is_some())
 }
 
 fn create_schema(connection: &Connection) -> Result<()> {
@@ -1470,7 +1456,7 @@ fn fts_query(query: &str) -> String {
     query
         .split(|character: char| !character.is_alphanumeric())
         .filter(|token| !token.is_empty())
-        .map(|token| format!("\"{}\"*", token.replace('"', "")))
+        .map(|token| format!("\"{token}\"*"))
         .collect::<Vec<_>>()
         .join(" ")
 }

@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io::{BufRead, BufReader, BufWriter, Read},
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -10,7 +10,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use futures_util::{StreamExt, stream};
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, Response, StatusCode};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -92,46 +92,39 @@ impl WikiHttp {
     }
 
     async fn get_json(&self, params: &[(String, String)]) -> Result<Value> {
-        for attempt in 0..5 {
-            self.limiter.wait().await;
-            let response = self.client.get(API_URL).query(params).send().await;
-            match response {
-                Ok(response) if response.status().is_success() => {
-                    let value: Value = response.json().await.context("decode MediaWiki JSON")?;
-                    if let Some(error) = value.get("error") {
-                        bail!("MediaWiki API error: {error}");
-                    }
-                    return Ok(value);
-                }
-                Ok(response)
-                    if response.status() == StatusCode::TOO_MANY_REQUESTS
-                        || response.status().is_server_error() =>
-                {
-                    let delay = retry_delay(response.headers().get("retry-after"), attempt);
-                    tokio::time::sleep(delay).await;
-                }
-                Ok(response) => bail!("MediaWiki API returned {}", response.status()),
-                Err(error) if attempt < 4 => {
-                    tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
-                    if error.is_builder() {
-                        return Err(error.into());
-                    }
-                }
-                Err(error) => return Err(error.into()),
-            }
+        let value: Value = self
+            .get(API_URL, Some(params))
+            .await?
+            .json()
+            .await
+            .context("decode MediaWiki JSON")?;
+        if let Some(error) = value.get("error") {
+            bail!("MediaWiki API error: {error}");
         }
-        bail!("MediaWiki API request failed after five attempts")
+        Ok(value)
     }
 
     async fn get_html(&self, revision_id: u64) -> Result<String> {
         let url = format!("{WIKI_ORIGIN}/rest.php/v1/revision/{revision_id}/html");
+        self.get(&url, None)
+            .await?
+            .text()
+            .await
+            .context("decode Parsoid HTML")
+    }
+
+    async fn get(&self, url: &str, params: Option<&[(String, String)]>) -> Result<Response> {
         for attempt in 0..5 {
             self.limiter.wait().await;
-            let response = self.client.get(&url).send().await;
+            let request = self.client.get(url);
+            let response = match params {
+                Some(params) => request.query(params),
+                None => request,
+            }
+            .send()
+            .await;
             match response {
-                Ok(response) if response.status().is_success() => {
-                    return response.text().await.context("decode Parsoid HTML");
-                }
+                Ok(response) if response.status().is_success() => return Ok(response),
                 Ok(response)
                     if response.status() == StatusCode::TOO_MANY_REQUESTS
                         || response.status().is_server_error() =>
@@ -139,10 +132,7 @@ impl WikiHttp {
                     let delay = retry_delay(response.headers().get("retry-after"), attempt);
                     tokio::time::sleep(delay).await;
                 }
-                Ok(response) => bail!(
-                    "Parsoid returned {} for revision {revision_id}",
-                    response.status()
-                ),
+                Ok(response) => bail!("HTTP request returned {} for {url}", response.status()),
                 Err(error) if attempt < 4 => {
                     tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
                     if error.is_builder() {
@@ -152,7 +142,7 @@ impl WikiHttp {
                 Err(error) => return Err(error.into()),
             }
         }
-        bail!("Parsoid request failed after five attempts for revision {revision_id}")
+        bail!("HTTP request failed after five attempts for {url}")
     }
 }
 
@@ -565,61 +555,6 @@ pub fn verify_snapshot(root: &Path) -> Result<SnapshotMetadata> {
     Ok(metadata)
 }
 
-fn package_directory(source: &Path, destination: &Path) -> Result<()> {
-    let file =
-        File::create(destination).with_context(|| format!("create {}", destination.display()))?;
-    let encoder = zstd::Encoder::new(BufWriter::new(file), 12)?;
-    let mut archive = tar::Builder::new(encoder.auto_finish());
-    archive.follow_symlinks(false);
-    archive
-        .append_dir_all(".", source)
-        .with_context(|| format!("archive {}", source.display()))?;
-    archive.finish()?;
-    Ok(())
-}
-
-pub fn package_release(
-    snapshot: &Path,
-    database: &Path,
-    model_cache: &Path,
-    output: &Path,
-) -> Result<Vec<PathBuf>> {
-    let metadata = verify_snapshot(snapshot)?;
-    fs::create_dir_all(output)?;
-    let snapshot_archive = output.join(format!(
-        "osrs-wiki-parsoid-{}.tar.zst",
-        metadata.snapshot_date
-    ));
-    let index_archive = output.join(format!(
-        "osrs-wiki-index-{}.tar.zst",
-        metadata.snapshot_date
-    ));
-    package_directory(snapshot, &snapshot_archive)?;
-
-    let file = File::create(&index_archive)
-        .with_context(|| format!("create {}", index_archive.display()))?;
-    let encoder = zstd::Encoder::new(BufWriter::new(file), 12)?;
-    let mut archive = tar::Builder::new(encoder.auto_finish());
-    archive.follow_symlinks(false);
-    archive.append_path_with_name(database, "index.sqlite")?;
-    archive.append_dir_all("model-cache", model_cache)?;
-    for name in [
-        "manifest.jsonl",
-        "excluded.jsonl",
-        "aliases.jsonl",
-        "snapshot.json",
-        "ATTRIBUTION.md",
-    ] {
-        archive.append_path_with_name(snapshot.join(name), name)?;
-    }
-    archive.finish()?;
-    drop(archive);
-
-    let artifacts = vec![snapshot_archive, index_archive];
-    release_checksums(&artifacts, &output.join("SHA256SUMS"))?;
-    Ok(artifacts)
-}
-
 pub fn read_json_lines<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
     let reader =
         BufReader::new(File::open(path).with_context(|| format!("open {}", path.display()))?);
@@ -718,28 +653,6 @@ fn required_u64(value: &Value, key: &str) -> Result<u64> {
         .ok_or_else(|| anyhow!("missing unsigned field {key}: {value}"))
 }
 
-pub fn release_checksums(paths: &[PathBuf], destination: &Path) -> Result<()> {
-    let mut lines = Vec::new();
-    for path in paths {
-        let mut file = File::open(path)?;
-        let mut hasher = Sha256::new();
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-        }
-        let name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("artifact");
-        lines.push(format!("{:x}  {name}", hasher.finalize()));
-    }
-    write_lines(destination, &lines)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,67 +726,6 @@ mod tests {
             fs::read_to_string(directory.path().join("failures.txt")).unwrap(),
             failures[0]
         );
-    }
-
-    #[test]
-    fn release_checksums_cover_finalized_archives() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let snapshot = directory.path().join("snapshot");
-        let model_cache = directory.path().join("model-cache");
-        fs::create_dir_all(snapshot.join("pages"))?;
-        fs::create_dir_all(&model_cache)?;
-        for name in ["manifest.jsonl", "excluded.jsonl", "aliases.jsonl"] {
-            fs::write(snapshot.join(name), [])?;
-        }
-        write_json(
-            &snapshot.join("snapshot.json"),
-            &SnapshotMetadata {
-                snapshot_date: "20260816".to_string(),
-                started_at: String::new(),
-                completed_at: String::new(),
-                wiki_origin: WIKI_ORIGIN.to_string(),
-                namespaces: NAMESPACES.to_vec(),
-                shard_index: None,
-                shard_count: None,
-                enumerated_pages: 0,
-                included_pages: 0,
-                excluded_pages: 0,
-                aliases: 0,
-                content_license: CONTENT_LICENSE.to_string(),
-                content_license_url: CONTENT_LICENSE_URL.to_string(),
-            },
-        )?;
-        write_attribution(&snapshot)?;
-        let database = directory.path().join("index.sqlite");
-        fs::write(&database, b"database")?;
-        fs::write(model_cache.join("MODEL_NOTICE.md"), b"model")?;
-
-        let output = directory.path().join("release");
-        let artifacts = package_release(&snapshot, &database, &model_cache, &output)?;
-        let checksums = fs::read_to_string(output.join("SHA256SUMS"))?;
-        for artifact in &artifacts {
-            let expected = format!(
-                "{}  {}",
-                sha256(&fs::read(artifact)?),
-                artifact.file_name().unwrap().to_string_lossy()
-            );
-            assert!(checksums.lines().any(|line| line == expected));
-        }
-
-        let decoder = zstd::Decoder::new(File::open(&artifacts[1])?)?;
-        let mut archive = tar::Archive::new(decoder);
-        let paths = archive
-            .entries()?
-            .map(|entry| Ok(entry?.path()?.to_string_lossy().into_owned()))
-            .collect::<Result<Vec<_>>>()?;
-        assert!(paths.iter().any(|path| path == "index.sqlite"));
-        assert!(paths.iter().any(|path| path == "manifest.jsonl"));
-        assert!(
-            paths
-                .iter()
-                .any(|path| path == "model-cache/MODEL_NOTICE.md")
-        );
-        Ok(())
     }
 
     #[test]
