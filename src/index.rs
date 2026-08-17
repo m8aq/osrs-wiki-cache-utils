@@ -266,6 +266,7 @@ pub fn build_index(options: IndexOptions) -> Result<()> {
         (None, None) => None,
         _ => bail!("cache dump and cache commit must be provided together"),
     };
+    eprintln!("index phase: load embedding model");
     let mut embedder = LocalEmbedder::open(&options.model_cache, true)?;
     if options.database.exists() && current_schema(&options.database)? {
         update_index(
@@ -290,6 +291,7 @@ fn build_new_index(
     cache: Option<&CacheSnapshot>,
     embedder: &mut LocalEmbedder,
 ) -> Result<()> {
+    eprintln!("index phase: verify snapshot");
     let metadata = verify_snapshot(snapshot)?;
     let pages: Vec<PageManifest> = read_json_lines(&snapshot.join("manifest.jsonl"))?;
     let raw_bytes = pages.iter().try_fold(0_u64, |total, page| {
@@ -310,18 +312,27 @@ fn build_new_index(
         "INSERT INTO meta(key, value) VALUES ('snapshot', ?1)",
         [serde_json::to_string(&metadata)?],
     )?;
-    for page in &pages {
+    eprintln!("wiki index: 0/{}", pages.len());
+    for (index, page) in pages.iter().enumerate() {
         insert_page(&transaction, snapshot, page, embedder)?;
+        let completed = index + 1;
+        if completed % 250 == 0 || completed == pages.len() {
+            eprintln!("wiki index: {completed}/{}", pages.len());
+        }
     }
     insert_aliases(&transaction, &aliases)?;
     if let Some(cache) = cache {
         insert_cache(&transaction, cache, embedder)?;
     }
+    eprintln!("index phase: commit database");
     transaction.commit()?;
+    eprintln!("index phase: rebuild full-text index");
     connection.execute("INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')", [])?;
+    eprintln!("index phase: optimize database");
     connection.execute_batch("PRAGMA optimize;")?;
     drop(connection);
     fs::rename(&temporary, database)?;
+    eprintln!("index complete: {} Wiki pages", pages.len());
     Ok(())
 }
 
@@ -331,6 +342,7 @@ fn update_index(
     cache: Option<&CacheSnapshot>,
     embedder: &mut LocalEmbedder,
 ) -> Result<()> {
+    eprintln!("index phase: verify snapshot");
     let metadata = verify_snapshot(snapshot)?;
     let pages: Vec<PageManifest> = read_json_lines(&snapshot.join("manifest.jsonl"))?;
     let aliases: Vec<AliasManifest> = read_json_lines(&snapshot.join("aliases.jsonl"))?;
@@ -383,8 +395,13 @@ fn update_index(
         transaction.execute("DELETE FROM sections WHERE page_id = ?1", [page_id])?;
         transaction.execute("DELETE FROM pages WHERE id = ?1", [page_id])?;
     }
-    for page in &changed {
+    eprintln!("wiki index update: 0/{}", changed.len());
+    for (index, page) in changed.iter().enumerate() {
         insert_page(&transaction, snapshot, page, embedder)?;
+        let completed = index + 1;
+        if completed % 250 == 0 || completed == changed.len() {
+            eprintln!("wiki index update: {completed}/{}", changed.len());
+        }
     }
     insert_aliases(&transaction, &aliases)?;
     let cache_counts = cache
@@ -718,11 +735,16 @@ fn cache_entry_url(commit: &str, path: &str) -> String {
 }
 
 fn insert_aliases(transaction: &Transaction<'_>, aliases: &[AliasManifest]) -> Result<()> {
-    for alias in aliases {
+    eprintln!("alias index: 0/{}", aliases.len());
+    for (index, alias) in aliases.iter().enumerate() {
         transaction.execute(
             "INSERT OR IGNORE INTO aliases(alias, page_id) SELECT ?1, id FROM pages WHERE title = ?2 COLLATE NOCASE",
             params![alias.alias, alias.target],
         )?;
+        let completed = index + 1;
+        if completed % 10_000 == 0 || completed == aliases.len() {
+            eprintln!("alias index: {completed}/{}", aliases.len());
+        }
     }
     Ok(())
 }

@@ -24,6 +24,8 @@ target/release/osrs-wiki-offline index \
   --database index.sqlite \
   --model-cache model-cache
 
+# Progress is reported by verification, Wiki pages, aliases, and finalization phase.
+
 # Search the Wiki.
 target/release/osrs-wiki-offline search \
   --database index.sqlite \

@@ -545,7 +545,8 @@ pub fn verify_snapshot(root: &Path) -> Result<SnapshotMetadata> {
     {
         bail!("snapshot counts do not match metadata");
     }
-    for page in &pages {
+    eprintln!("snapshot verify: 0/{}", pages.len());
+    for (index, page) in pages.iter().enumerate() {
         let path = root.join(&page.path);
         let html = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
         if sha256(&html) != page.sha256 {
@@ -555,6 +556,10 @@ pub fn verify_snapshot(root: &Path) -> Result<SnapshotMetadata> {
             String::from_utf8(html).with_context(|| format!("UTF-8 HTML for {}", page.title))?;
         if extract_page(&text)?.revision_id != Some(page.revision_id) {
             bail!("revision mismatch for {}", page.title);
+        }
+        let completed = index + 1;
+        if completed % 1_000 == 0 || completed == pages.len() {
+            eprintln!("snapshot verify: {completed}/{}", pages.len());
         }
     }
     Ok(metadata)
