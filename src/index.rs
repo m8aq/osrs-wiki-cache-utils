@@ -738,7 +738,7 @@ fn insert_aliases(transaction: &Transaction<'_>, aliases: &[AliasManifest]) -> R
     eprintln!("alias index: 0/{}", aliases.len());
     for (index, alias) in aliases.iter().enumerate() {
         transaction.execute(
-            "INSERT OR IGNORE INTO aliases(alias, page_id) SELECT ?1, id FROM pages WHERE title = ?2 COLLATE NOCASE",
+            "INSERT OR IGNORE INTO aliases(alias, page_id) SELECT ?1, id FROM pages WHERE title = ?2 COLLATE NOCASE ORDER BY title = ?2 DESC LIMIT 1",
             params![alias.alias, alias.target],
         )?;
         let completed = index + 1;
@@ -766,7 +766,12 @@ fn current_schema(database: &Path) -> Result<bool> {
         [],
         |row| row.get(0),
     )?;
-    Ok(required == 4 && redundant == 0 && cache_entries == 1)
+    let unique_page_indexes: i64 = connection.query_row(
+        "SELECT count(*) FROM pragma_index_list('pages') WHERE [unique] = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(required == 4 && redundant == 0 && cache_entries == 1 && unique_page_indexes == 0)
 }
 
 fn require_free_space(path: &Path, required: u64) -> Result<()> {
@@ -1208,7 +1213,7 @@ impl SearchEngine {
         cache_kind: Option<&str>,
     ) -> Result<Option<i64>> {
         let sql = if source_kind == "wiki" {
-            "SELECT id FROM pages WHERE source_kind = 'wiki' AND title = ?1 COLLATE NOCASE UNION ALL SELECT a.page_id FROM aliases a JOIN pages p ON p.id = a.page_id WHERE p.source_kind = 'wiki' AND a.alias = ?1 COLLATE NOCASE LIMIT 1"
+            "SELECT id FROM (SELECT id, CASE WHEN title = ?1 THEN 0 ELSE 1 END AS priority FROM pages WHERE source_kind = 'wiki' AND title = ?1 COLLATE NOCASE UNION ALL SELECT a.page_id, 2 FROM aliases a JOIN pages p ON p.id = a.page_id WHERE p.source_kind = 'wiki' AND a.alias = ?1 COLLATE NOCASE) ORDER BY priority LIMIT 1"
         } else {
             "SELECT p.id FROM pages p JOIN cache_entries ce ON ce.page_id = p.id WHERE p.source_kind = 'cache' AND (p.title = ?1 COLLATE NOCASE OR ce.symbol = ?1 COLLATE NOCASE) AND (?2 IS NULL OR ce.kind = ?2 COLLATE NOCASE) LIMIT 1"
         };
@@ -1358,7 +1363,7 @@ fn create_schema(connection: &Connection) -> Result<()> {
            id INTEGER PRIMARY KEY,
            source_kind TEXT NOT NULL CHECK(source_kind IN ('wiki', 'cache')),
            namespace INTEGER NOT NULL,
-           title TEXT NOT NULL UNIQUE COLLATE NOCASE,
+           title TEXT NOT NULL,
            revision_id INTEGER NOT NULL,
            revision_url TEXT NOT NULL,
            modified_at TEXT NOT NULL,
@@ -1399,6 +1404,7 @@ fn create_schema(connection: &Connection) -> Result<()> {
            UNIQUE(kind, entry_id)
          );
          CREATE INDEX pages_source ON pages(source_kind);
+         CREATE INDEX pages_title ON pages(title COLLATE NOCASE);
          CREATE INDEX cache_lookup ON cache_entries(kind, entry_id);
          CREATE INDEX chunks_page ON chunks(page_id);
          CREATE INDEX sections_page ON sections(page_id, section_index);
@@ -1543,6 +1549,46 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn schema_allows_case_distinct_wiki_titles() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_schema(&connection).unwrap();
+        for (page_id, title) in [
+            (1_i64, "Asgarnian Ale (barrel)"),
+            (2, "Asgarnian ale (barrel)"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO pages(id, source_kind, namespace, title, revision_id, revision_url, modified_at, fetched_at, url, categories_json, content_sha256, raw_content_zstd) VALUES (?1, 'wiki', 0, ?2, 0, '', '', '', '', '[]', '', X'')",
+                    params![page_id, title],
+                )
+                .unwrap();
+        }
+        let count: i64 = connection
+            .query_row("SELECT count(*) FROM pages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+
+        let transaction = connection.transaction().unwrap();
+        insert_aliases(
+            &transaction,
+            &[AliasManifest {
+                alias: "Lowercase barrel".to_string(),
+                target: "Asgarnian ale (barrel)".to_string(),
+            }],
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        let target: i64 = connection
+            .query_row(
+                "SELECT page_id FROM aliases WHERE alias = 'Lowercase barrel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(target, 2);
     }
 
     #[test]
