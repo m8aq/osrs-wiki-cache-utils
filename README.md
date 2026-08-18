@@ -2,7 +2,8 @@
 
 ## About
 
-Search the Old School RuneScape Wiki and decoded game cache entirely offline.
+Search the Old School RuneScape Wiki, decoded game cache, RuneLite, and Plugin
+Hub source entirely offline.
 
 Unlike `rg`, this tool understands Wiki sections, nested tables, tabs, titles,
 and redirects. SQLite FTS5 ranks the most useful matching sections and cache
@@ -27,7 +28,7 @@ No Rust toolchain or indexing is needed.
 ```sh
 mkdir -p "$HOME/Documents/osrs" && cd "$HOME/Documents/osrs"
 BASE=https://github.com/m8aq/osrs-wiki-cache-utils/releases/latest/download
-curl -fL "$BASE/osrs-wiki-cache-utils-v0.1.0-aarch64-apple-darwin" -o osrs-wiki-cache-utils
+curl -fL "$BASE/osrs-wiki-cache-utils-v0.2.0-aarch64-apple-darwin" -o osrs-wiki-cache-utils
 curl -fLO "$BASE/wiki.sqlite"
 chmod +x osrs-wiki-cache-utils
 ```
@@ -37,7 +38,7 @@ chmod +x osrs-wiki-cache-utils
 ```sh
 mkdir -p "$HOME/Documents/osrs" && cd "$HOME/Documents/osrs"
 BASE=https://github.com/m8aq/osrs-wiki-cache-utils/releases/latest/download
-curl -fL "$BASE/osrs-wiki-cache-utils-v0.1.0-x86_64-unknown-linux-musl" -o osrs-wiki-cache-utils
+curl -fL "$BASE/osrs-wiki-cache-utils-v0.2.0-x86_64-unknown-linux-musl" -o osrs-wiki-cache-utils
 curl -fLO "$BASE/wiki.sqlite"
 chmod +x osrs-wiki-cache-utils
 ```
@@ -48,7 +49,7 @@ chmod +x osrs-wiki-cache-utils
 New-Item -ItemType Directory -Force "$HOME\Documents\osrs" | Out-Null
 Set-Location "$HOME\Documents\osrs"
 $base = "https://github.com/m8aq/osrs-wiki-cache-utils/releases/latest/download"
-Invoke-WebRequest "$base/osrs-wiki-cache-utils-v0.1.0-x86_64-pc-windows-msvc.exe" -OutFile osrs-wiki-cache-utils.exe
+Invoke-WebRequest "$base/osrs-wiki-cache-utils-v0.2.0-x86_64-pc-windows-msvc.exe" -OutFile osrs-wiki-cache-utils.exe
 Invoke-WebRequest "$base/wiki.sqlite" -OutFile wiki.sqlite
 ```
 
@@ -91,6 +92,31 @@ Invoke-WebRequest "$base/cache.sqlite" -OutFile cache.sqlite
 The cache index covers decoded configs, interfaces, scripts, and symbols. It
 does not include binary assets such as maps, models, sprites, or audio.
 
+### Search RuneLite and Plugin Hub code
+
+Download the optional code database, then search all indexed Java source or one
+RuneLite module/Plugin Hub plugin. Plugin Hub kinds use
+`pluginhub/<internalName>`:
+
+```sh
+curl -fLO "$BASE/runelite-code.sqlite"
+
+./osrs-wiki-cache-utils code-search \
+  --database wiki.sqlite \
+  --code-database runelite-code.sqlite \
+  --kind pluginhub/blast-furnace-trainer \
+  "blast furnace"
+```
+
+On Windows PowerShell, download it with:
+
+```powershell
+Invoke-WebRequest "$base/runelite-code.sqlite" -OutFile runelite-code.sqlite
+```
+
+Use the result's case-sensitive `kind` and `id` with `code-get` to retrieve the
+exact source file.
+
 Checksums for every release download are in `SHA256SUMS.txt`.
 
 ## MCP
@@ -105,7 +131,8 @@ Add the server to an MCP client using absolute paths:
       "args": [
         "serve",
         "--database", "/absolute/path/wiki.sqlite",
-        "--cache-database", "/absolute/path/cache.sqlite"
+        "--cache-database", "/absolute/path/cache.sqlite",
+        "--code-database", "/absolute/path/runelite-code.sqlite"
       ]
     }
   }
@@ -113,8 +140,8 @@ Add the server to an MCP client using absolute paths:
 ```
 
 The MCP returns source text and provenance for the client to interpret. It can
-search both databases, retrieve Wiki pages or individual sections, and retrieve
-exact cache records.
+search each configured database, retrieve Wiki pages or individual sections,
+and retrieve exact cache records or source files.
 
 ## Build Your Own Data
 
@@ -148,8 +175,49 @@ $BIN cache-index \
 Rerun these commands to update the data. Unchanged records are reused, and
 interrupted builds resume automatically.
 
+To build `runelite-code.sqlite`, clone the source aggregate and a sparse
+RuneLite checkout, then pin both exact commits:
+
+```sh
+git clone --depth 1 \
+  https://github.com/JZomDev/pluginhub-searcher.git pluginhub-searcher
+git clone --depth 1 --filter=blob:none --sparse \
+  https://github.com/runelite/runelite.git runelite
+git -C runelite sparse-checkout set runelite-api runelite-client
+git clone --depth 1 \
+  https://github.com/runelite/plugin-hub-tooling.git plugin-hub-tooling
+git clone --depth 1 --filter=blob:none --sparse \
+  https://github.com/runelite/api.runelite.net.git api.runelite.net
+git -C api.runelite.net sparse-checkout set http-api
+
+$BIN code-index \
+  --database runelite-code.sqlite \
+  --pluginhub-repo pluginhub-searcher \
+  --pluginhub-commit "$(git -C pluginhub-searcher rev-parse HEAD)" \
+  --runelite-repo runelite \
+  --runelite-commit "$(git -C runelite rev-parse HEAD)"
+
+$BIN code-enrich \
+  --database runelite-code.sqlite \
+  --tooling-repo plugin-hub-tooling \
+  --tooling-commit "$(git -C plugin-hub-tooling rev-parse HEAD)" \
+  --http-api-repo api.runelite.net \
+  --http-api-commit "$(git -C api.runelite.net rev-parse HEAD)"
+
+$BIN verify --code-database runelite-code.sqlite
+```
+
+This indexes the 29,973 Java files across all 2,124 plugin records bundled by
+the pinned `pluginhub-searcher` revision, including unavailable/build-failing
+records. It also indexes Java from `runelite-api`, `runelite-client`, Plugin Hub
+tooling, and the RuneLite HTTP API module. Original Plugin Hub repositories are
+not cloned or fetched individually. The database retains each file's source
+repository, pinned commit, immutable URL, and source header; upstream sources
+retain their individual licenses.
+
 ## License
 
 Wiki content is [CC BY-NC-SA 3.0](https://creativecommons.org/licenses/by-nc-sa/3.0/)
 with per-revision attribution. Game-cache data has separate provenance. The
+RuneLite and Plugin Hub sources retain their individual upstream licenses. The
 source code in this repository is MIT licensed.

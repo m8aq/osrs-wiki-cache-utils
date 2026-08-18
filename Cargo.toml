@@ -1,15 +1,16 @@
 [package]
 name = "osrs-wiki-cache-utils"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
-description = "Build and search offline OSRS Wiki and decoded game-cache indexes"
+description = "Build and search offline OSRS Wiki, game-cache, and RuneLite source indexes"
 
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 futures-util = "0.3"
+flate2 = "1"
 parsoid = "0.10.1"
 percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

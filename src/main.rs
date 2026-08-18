@@ -1,4 +1,5 @@
 mod cache;
+mod code;
 mod extract;
 mod index;
 mod mcp;
@@ -9,7 +10,10 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use index::{SearchEngine, build_cache_index, build_index, verify_cache_index, verify_index};
+use index::{
+    SearchEngine, build_cache_index, build_code_index, build_index, enrich_code_index,
+    verify_cache_index, verify_code_index, verify_index,
+};
 use mcp::OfflineWiki;
 use rmcp::{ServiceExt, transport::stdio};
 use snapshot::{build_snapshot, verify_snapshot};
@@ -51,11 +55,37 @@ enum Command {
         #[arg(long)]
         cache_commit: String,
     },
+    CodeIndex {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        pluginhub_repo: PathBuf,
+        #[arg(long)]
+        pluginhub_commit: String,
+        #[arg(long)]
+        runelite_repo: PathBuf,
+        #[arg(long)]
+        runelite_commit: String,
+    },
+    CodeEnrich {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        tooling_repo: PathBuf,
+        #[arg(long)]
+        tooling_commit: String,
+        #[arg(long)]
+        http_api_repo: PathBuf,
+        #[arg(long)]
+        http_api_commit: String,
+    },
     Serve {
         #[arg(long)]
         database: PathBuf,
         #[arg(long)]
         cache_database: Option<PathBuf>,
+        #[arg(long)]
+        code_database: Option<PathBuf>,
     },
     Search {
         #[arg(long)]
@@ -83,13 +113,34 @@ enum Command {
         kind: String,
         id: String,
     },
+    CodeSearch {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        code_database: PathBuf,
+        query: String,
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+        #[arg(long)]
+        kind: Option<String>,
+    },
+    CodeGet {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        code_database: PathBuf,
+        kind: String,
+        id: String,
+    },
     Verify {
         #[arg(long)]
-        snapshot: PathBuf,
+        snapshot: Option<PathBuf>,
         #[arg(long)]
         database: Option<PathBuf>,
         #[arg(long)]
         cache_database: Option<PathBuf>,
+        #[arg(long)]
+        code_database: Option<PathBuf>,
     },
 }
 
@@ -115,12 +166,42 @@ async fn main() -> Result<()> {
             cache_dump,
             cache_commit,
         } => build_cache_index(&database, &cache_dump, &cache_commit)?,
+        Command::CodeIndex {
+            database,
+            pluginhub_repo,
+            pluginhub_commit,
+            runelite_repo,
+            runelite_commit,
+        } => build_code_index(
+            &database,
+            &pluginhub_repo,
+            &pluginhub_commit,
+            &runelite_repo,
+            &runelite_commit,
+        )?,
+        Command::CodeEnrich {
+            database,
+            tooling_repo,
+            tooling_commit,
+            http_api_repo,
+            http_api_commit,
+        } => enrich_code_index(
+            &database,
+            &tooling_repo,
+            &tooling_commit,
+            &http_api_repo,
+            &http_api_commit,
+        )?,
         Command::Serve {
             database,
             cache_database,
+            code_database,
         } => {
-            let server =
-                OfflineWiki::new(SearchEngine::open(&database, cache_database.as_deref())?);
+            let server = OfflineWiki::new(SearchEngine::open(
+                &database,
+                cache_database.as_deref(),
+                code_database.as_deref(),
+            )?);
             server.serve(stdio()).await?.waiting().await?;
         }
         Command::Search {
@@ -128,7 +209,7 @@ async fn main() -> Result<()> {
             query,
             limit,
         } => {
-            let output = SearchEngine::open(&database, None)?.search(&query, limit)?;
+            let output = SearchEngine::open(&database, None, None)?.search(&query, limit)?;
             println!("{}", serde_json::to_string_pretty(&output)?);
         }
         Command::CacheSearch {
@@ -138,7 +219,7 @@ async fn main() -> Result<()> {
             limit,
             kind,
         } => {
-            let output = SearchEngine::open(&database, Some(&cache_database))?.search_cache(
+            let output = SearchEngine::open(&database, Some(&cache_database), None)?.search_cache(
                 &query,
                 limit,
                 kind.as_deref(),
@@ -151,23 +232,56 @@ async fn main() -> Result<()> {
             kind,
             id,
         } => {
-            let output =
-                SearchEngine::open(&database, Some(&cache_database))?.cache_entry(&kind, &id)?;
+            let output = SearchEngine::open(&database, Some(&cache_database), None)?
+                .cache_entry(&kind, &id)?;
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        Command::CodeSearch {
+            database,
+            code_database,
+            query,
+            limit,
+            kind,
+        } => {
+            let output = SearchEngine::open(&database, None, Some(&code_database))?.search_code(
+                &query,
+                limit,
+                kind.as_deref(),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        Command::CodeGet {
+            database,
+            code_database,
+            kind,
+            id,
+        } => {
+            let output = SearchEngine::open(&database, None, Some(&code_database))?
+                .code_entry(&kind, &id)?;
             println!("{}", serde_json::to_string_pretty(&output)?);
         }
         Command::Verify {
             snapshot,
             database,
             cache_database,
+            code_database,
         } => {
-            let metadata = verify_snapshot(&snapshot)?;
+            let metadata = snapshot.as_deref().map(verify_snapshot).transpose()?;
             if let Some(database) = database {
-                verify_index(&database, &snapshot)?;
+                let snapshot = snapshot
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("--snapshot is required with --database"))?;
+                verify_index(&database, snapshot)?;
             }
             if let Some(database) = cache_database {
                 verify_cache_index(&database)?;
             }
-            eprintln!("verified snapshot {}", metadata.snapshot_date);
+            if let Some(database) = code_database {
+                verify_code_index(&database)?;
+            }
+            if let Some(metadata) = metadata {
+                eprintln!("verified snapshot {}", metadata.snapshot_date);
+            }
         }
     }
     Ok(())

@@ -11,8 +11,8 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::index::{
-    CacheEntryOutput, PageOutput, SearchEngine, SearchOutput, SectionOutput, SectionsOutput,
-    UnifiedSearchOutput,
+    CacheEntryOutput, CodeEntryOutput, PageOutput, SearchEngine, SearchOutput, SectionOutput,
+    SectionsOutput, UnifiedSearchOutput,
 };
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -24,6 +24,14 @@ pub struct SearchRequest {
 /// Searches decoded cache records, optionally restricting the record kind.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CacheSearchRequest {
+    pub query: String,
+    pub limit: Option<usize>,
+    pub kind: Option<String>,
+}
+
+/// Searches source files, optionally restricting the RuneLite module or Plugin Hub plugin.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CodeSearchRequest {
     pub query: String,
     pub limit: Option<usize>,
     pub kind: Option<String>,
@@ -43,6 +51,13 @@ pub struct SectionRequest {
 /// Identifies one decoded cache record returned by cache search.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CacheEntryRequest {
+    pub kind: String,
+    pub id: String,
+}
+
+/// Identifies one case-sensitive source file returned by code search.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CodeEntryRequest {
     pub kind: String,
     pub id: String,
 }
@@ -130,6 +145,36 @@ impl OfflineWiki {
     }
 
     #[tool(
+        name = "search_code",
+        description = "Search revision-pinned Java from RuneLite API/client, HTTP API, Plugin Hub plugins, and Plugin Hub tooling. Restrict by runelite-api, runelite-client, runelite-http-api, pluginhub-tooling, or pluginhub/<internalName>. Results include the exact kind and ID needed for get_code_entry."
+    )]
+    pub async fn search_code(
+        &self,
+        Parameters(request): Parameters<CodeSearchRequest>,
+    ) -> Result<Json<SearchOutput>, String> {
+        self.with_engine(|engine| {
+            engine.search_code(
+                &request.query,
+                request.limit.unwrap_or(5),
+                request.kind.as_deref(),
+            )
+        })
+        .map(Json)
+    }
+
+    #[tool(
+        name = "get_code_entry",
+        description = "Get one exact RuneLite, Plugin Hub, or plugin repository source file using the case-sensitive kind and ID returned by search_code."
+    )]
+    pub async fn get_code_entry(
+        &self,
+        Parameters(request): Parameters<CodeEntryRequest>,
+    ) -> Result<Json<CodeEntryOutput>, String> {
+        self.with_engine(|engine| engine.code_entry(&request.kind, &request.id))
+            .map(Json)
+    }
+
+    #[tool(
         name = "get_wiki_page",
         description = "Get a bounded readable page and section index from the offline Wiki snapshot."
     )]
@@ -172,10 +217,10 @@ impl ServerHandler for OfflineWiki {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(
                 Implementation::new("osrs-wiki-cache-utils", env!("CARGO_PKG_VERSION"))
-                    .with_title("Offline OSRS Wiki and Cache"),
+                    .with_title("Offline OSRS Wiki, Cache, and RuneLite Code"),
             )
             .with_instructions(
-                "Search is lexical: translate natural-language requests into short, focused queries and try multiple vocabulary variants when needed. Use search_unified when either source may answer the query. For implementation questions, use search_wiki for gameplay context, then make focused search_cache calls with a kind such as config/loc or config/varbit. Use get_cache_entry for the complete revision-pinned record. Cache data is raw client data, not player state or a gameplay explanation.",
+                "Search is lexical: translate natural-language requests into short, focused queries and try multiple vocabulary variants when needed. Use search_unified for Wiki and game-cache questions. For plugin implementation questions, combine search_wiki for gameplay context, search_cache for raw client definitions, and search_code for RuneLite or Plugin Hub implementations. Use get_cache_entry or get_code_entry for the complete revision-pinned record.",
             )
     }
 }

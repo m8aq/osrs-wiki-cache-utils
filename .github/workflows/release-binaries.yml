@@ -23,12 +23,12 @@ jobs:
       - run: cargo test --release --locked
       - run: cargo build --release --locked --target x86_64-unknown-linux-musl
       - run: |
-          cp target/x86_64-unknown-linux-musl/release/osrs-wiki-cache-utils osrs-wiki-cache-utils-v0.1.0-x86_64-unknown-linux-musl
-          ./osrs-wiki-cache-utils-v0.1.0-x86_64-unknown-linux-musl --version
+          cp target/x86_64-unknown-linux-musl/release/osrs-wiki-cache-utils osrs-wiki-cache-utils-v0.2.0-x86_64-unknown-linux-musl
+          ./osrs-wiki-cache-utils-v0.2.0-x86_64-unknown-linux-musl --version
       - uses: actions/upload-artifact@v4
         with:
           name: linux
-          path: osrs-wiki-cache-utils-v0.1.0-x86_64-unknown-linux-musl
+          path: osrs-wiki-cache-utils-v0.2.0-x86_64-unknown-linux-musl
           if-no-files-found: error
           retention-days: 1
 
@@ -42,11 +42,11 @@ jobs:
       - run: cargo build --release --locked
       - shell: pwsh
         run: |
-          Copy-Item target/release/osrs-wiki-cache-utils.exe osrs-wiki-cache-utils-v0.1.0-x86_64-pc-windows-msvc.exe
-          .\osrs-wiki-cache-utils-v0.1.0-x86_64-pc-windows-msvc.exe --version
+          Copy-Item target/release/osrs-wiki-cache-utils.exe osrs-wiki-cache-utils-v0.2.0-x86_64-pc-windows-msvc.exe
+          .\osrs-wiki-cache-utils-v0.2.0-x86_64-pc-windows-msvc.exe --version
       - uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: osrs-wiki-cache-utils-v0.1.0-x86_64-pc-windows-msvc.exe
+          path: osrs-wiki-cache-utils-v0.2.0-x86_64-pc-windows-msvc.exe
           if-no-files-found: error
           retention-days: 1

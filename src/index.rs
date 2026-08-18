@@ -16,6 +16,10 @@ use sha2::{Digest, Sha256};
 use crate::{
     CONTENT_LICENSE, CONTENT_LICENSE_URL, WIKI_ORIGIN,
     cache::{CACHE_ORIGIN, CacheDocument, CacheMetadata, CacheSnapshot, read_cache_dump},
+    code::{
+        CodeDocument, CodeMetadata, CodeSnapshot, PLUGINHUB_SEARCHER_ORIGIN, read_code_sources,
+        read_git_text_documents,
+    },
     extract::{chunks_for_section, extract_page},
     model::{AliasManifest, PageManifest, SnapshotMetadata},
     snapshot::{read_json_lines, verify_snapshot},
@@ -150,6 +154,9 @@ pub struct CacheEntryOutput {
     pub provenance: Provenance,
 }
 
+/// One bounded source file from RuneLite or a Plugin Hub repository.
+pub type CodeEntryOutput = CacheEntryOutput;
+
 struct PageRow {
     id: i64,
     source_kind: String,
@@ -163,8 +170,10 @@ struct PageRow {
 pub struct SearchEngine {
     connection: Connection,
     cache_connection: Option<Connection>,
+    code_connection: Option<Connection>,
     snapshot_date: String,
     cache: Option<CacheMetadata>,
+    code: Option<CodeMetadata>,
 }
 
 pub fn build_index(snapshot: &Path, database: &Path) -> Result<()> {
@@ -404,6 +413,293 @@ pub fn build_cache_index(database: &Path, cache_dump: &Path, cache_commit: &str)
     Ok(())
 }
 
+/// Builds or incrementally updates the standalone RuneLite and Plugin Hub source index.
+pub fn build_code_index(
+    database: &Path,
+    pluginhub_repo: &Path,
+    pluginhub_commit: &str,
+    runelite_repo: &Path,
+    runelite_commit: &str,
+) -> Result<()> {
+    let code = read_code_sources(
+        pluginhub_repo,
+        pluginhub_commit,
+        runelite_repo,
+        runelite_commit,
+    )?;
+    if database.exists() && current_schema(database, "code")? {
+        let mut connection = Connection::open(database)?;
+        let transaction = connection.transaction()?;
+        let counts = update_code(&transaction, &code)?;
+        transaction.commit()?;
+        connection.execute_batch("PRAGMA optimize;")?;
+        let metadata: CodeMetadata = serde_json::from_str(&connection.query_row(
+            "SELECT value FROM meta WHERE key = 'code'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?)?;
+        verify_page_count(&connection, "code", metadata.entries)?;
+        eprintln!(
+            "code update: {} changed, {} removed, {} unchanged",
+            counts.0, counts.1, counts.2
+        );
+        return Ok(());
+    }
+
+    if let Some(parent) = database.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let required = code
+        .documents
+        .iter()
+        .map(|document| document.content.len() as u64)
+        .sum::<u64>()
+        .saturating_mul(2);
+    require_free_space(database, required)?;
+    let temporary = database.with_extension("sqlite.part");
+    let mut connection = Connection::open(&temporary)?;
+    if current_schema(&temporary, "code")? {
+        let stored: CodeMetadata = serde_json::from_str(&connection.query_row(
+            "SELECT value FROM meta WHERE key = 'code'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?)?;
+        if stored.pluginhub_commit != code.metadata.pluginhub_commit
+            || stored.runelite_commit != code.metadata.runelite_commit
+        {
+            bail!(
+                "partial code index belongs to different source commits; remove {} to rebuild",
+                temporary.display()
+            );
+        }
+    } else {
+        drop(connection);
+        let _ = fs::remove_file(&temporary);
+        connection = Connection::open(&temporary)?;
+        create_schema(&connection)?;
+        connection.execute(
+            "INSERT INTO meta(key, value) VALUES ('code', ?1)",
+            [serde_json::to_string(&code.metadata)?],
+        )?;
+    }
+    let existing = indexed_cache_keys(&connection)?;
+    eprintln!("code index: {}/{}", existing.len(), code.documents.len());
+    for (batch_index, batch) in code.documents.chunks(CACHE_BATCH_SIZE).enumerate() {
+        let transaction = connection.transaction()?;
+        for (offset, document) in batch.iter().enumerate() {
+            if existing.contains(&(document.kind.clone(), document.id.clone())) {
+                continue;
+            }
+            let index = batch_index * CACHE_BATCH_SIZE + offset;
+            insert_code_document(
+                &transaction,
+                document,
+                -1 - index as i64,
+                &code.metadata.indexed_at,
+            )?;
+        }
+        transaction.commit()?;
+        eprintln!(
+            "code index: {}/{}",
+            ((batch_index + 1) * CACHE_BATCH_SIZE).min(code.documents.len()),
+            code.documents.len()
+        );
+    }
+    verify_page_count(&connection, "code", code.documents.len())?;
+    connection.execute_batch("PRAGMA optimize;")?;
+    drop(connection);
+    fs::rename(&temporary, database)?;
+    eprintln!(
+        "code index complete: {} plugins, {} files, {} skipped non-UTF-8 RuneLite files",
+        code.metadata.plugins,
+        code.documents.len(),
+        code.metadata.skipped_runelite_files.len()
+    );
+    Ok(())
+}
+
+/// Adds the official Plugin Hub tooling and HTTP API Java sources.
+pub fn enrich_code_index(
+    database: &Path,
+    tooling_repo: &Path,
+    tooling_commit: &str,
+    http_api_repo: &Path,
+    http_api_commit: &str,
+) -> Result<()> {
+    if !current_schema(database, "code")? {
+        bail!("{} is not a current code database", database.display());
+    }
+    let (tooling_commit, tooling) = read_git_text_documents(
+        tooling_repo,
+        tooling_commit,
+        &["."],
+        "pluginhub-tooling",
+        "Plugin Hub tooling",
+        "https://github.com/runelite/plugin-hub-tooling",
+    )?;
+    let (http_api_commit, http_api) = read_git_text_documents(
+        http_api_repo,
+        http_api_commit,
+        &["http-api"],
+        "runelite-http-api",
+        "RuneLite HTTP API",
+        "https://github.com/runelite/api.runelite.net",
+    )?;
+    let indexed_at = chrono::Utc::now().to_rfc3339();
+    let mut connection = Connection::open(database)?;
+    migrate_java_corpus(&mut connection)?;
+    replace_enrichment_kind(
+        &mut connection,
+        "enrich:pluginhub-tooling",
+        "pluginhub-tooling",
+        &tooling_commit,
+        &tooling,
+        &indexed_at,
+    )?;
+    replace_enrichment_kind(
+        &mut connection,
+        "enrich:runelite-http-api",
+        "runelite-http-api",
+        &http_api_commit,
+        &http_api,
+        &indexed_at,
+    )?;
+
+    let mut metadata: CodeMetadata = serde_json::from_str(&connection.query_row(
+        "SELECT value FROM meta WHERE key = 'code'",
+        [],
+        |row| row.get::<_, String>(0),
+    )?)?;
+    metadata.entries =
+        usize::try_from(
+            connection.query_row("SELECT count(*) FROM pages", [], |row| row.get::<_, i64>(0))?,
+        )?;
+    metadata.plugin_repositories = 0;
+    metadata.pluginhub_tooling_commit = Some(tooling_commit);
+    metadata.http_api_commit = Some(http_api_commit);
+    metadata.plugin_repository_failures.clear();
+    metadata.indexed_at = indexed_at;
+    connection.execute(
+        "UPDATE meta SET value = ?1 WHERE key = 'code'",
+        [serde_json::to_string(&metadata)?],
+    )?;
+    connection.execute_batch("PRAGMA optimize;")?;
+    verify_page_count(&connection, "code", metadata.entries)?;
+    eprintln!(
+        "code enrichment complete: {} total Java files",
+        metadata.entries
+    );
+    Ok(())
+}
+
+fn replace_enrichment_kind(
+    connection: &mut Connection,
+    checkpoint: &str,
+    kind: &str,
+    commit: &str,
+    documents: &[CodeDocument],
+    indexed_at: &str,
+) -> Result<()> {
+    let stored: Option<String> = connection
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            [checkpoint],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if stored.as_deref() == Some(commit) {
+        return Ok(());
+    }
+    let transaction = connection.transaction()?;
+    let page_ids = {
+        let mut statement =
+            transaction.prepare("SELECT page_id FROM cache_entries WHERE kind = ?1")?;
+        statement
+            .query_map([kind], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?
+    };
+    for page_id in page_ids {
+        delete_page(&transaction, page_id)?;
+    }
+    let mut next_id: i64 = transaction.query_row("SELECT min(id) - 1 FROM pages", [], |row| {
+        Ok(row.get::<_, Option<i64>>(0)?.unwrap_or(-1).min(-1))
+    })?;
+    for document in documents {
+        insert_code_document(&transaction, document, next_id, indexed_at)?;
+        next_id -= 1;
+    }
+    transaction.execute(
+        "INSERT INTO meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![checkpoint, commit],
+    )?;
+    refresh_code_counts(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_java_corpus(connection: &mut Connection) -> Result<()> {
+    let obsolete = {
+        let mut statement = connection.prepare(
+            "SELECT ce.page_id, ce.kind, ce.entry_id FROM cache_entries ce WHERE ce.kind LIKE 'pluginrepo/%' OR ce.kind IN ('pluginhub-tooling', 'runelite-http-api')",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .filter_map(|row| match row {
+                Ok((page_id, kind, id)) => (kind.starts_with("pluginrepo/")
+                    || !id.to_ascii_lowercase().ends_with(".java"))
+                .then_some(Ok(page_id)),
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let transaction = connection.transaction()?;
+    for page_id in &obsolete {
+        delete_page(&transaction, *page_id)?;
+    }
+    transaction.execute("DELETE FROM meta WHERE key LIKE 'pluginrepo:%'", [])?;
+    refresh_code_counts(&transaction)?;
+    transaction.commit()?;
+    if !obsolete.is_empty() {
+        eprintln!(
+            "Java corpus migration: removed {} supplemental files",
+            obsolete.len()
+        );
+    }
+    Ok(())
+}
+
+fn refresh_code_counts(transaction: &Transaction<'_>) -> Result<()> {
+    let Some(value) = transaction
+        .query_row("SELECT value FROM meta WHERE key = 'code'", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?
+    else {
+        return Ok(());
+    };
+    let mut metadata: CodeMetadata = serde_json::from_str(&value)?;
+    metadata.entries =
+        usize::try_from(
+            transaction.query_row("SELECT count(*) FROM pages", [], |row| row.get::<_, i64>(0))?,
+        )?;
+    metadata.plugin_repositories = usize::try_from(transaction.query_row(
+        "SELECT count(*) FROM meta WHERE key LIKE 'pluginrepo:%'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?)?;
+    transaction.execute(
+        "UPDATE meta SET value = ?1 WHERE key = 'code'",
+        [serde_json::to_string(&metadata)?],
+    )?;
+    Ok(())
+}
+
 fn insert_page(transaction: &Transaction<'_>, snapshot: &Path, page: &PageManifest) -> Result<()> {
     let html = fs::read_to_string(snapshot.join(&page.path))?;
     let extracted = extract_page(&html)?;
@@ -558,6 +854,145 @@ fn insert_cache_document(
     transaction.execute(
         "INSERT INTO cache_entries(page_id, kind, entry_id, symbol, path, commit_sha) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![page_id, document.kind, document.id, document.symbol, document.path, cache.metadata.commit],
+    )?;
+    transaction.execute(
+        "INSERT INTO sections(page_id, section_index, level, heading, content) VALUES (?1, 0, 1, ?2, ?3)",
+        params![page_id, document.kind, document.content],
+    )?;
+    let section_id = transaction.last_insert_rowid();
+    let blocks = document
+        .content
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    for (ordinal, text) in chunks_for_section(&document.title, &document.kind, &blocks)
+        .into_iter()
+        .enumerate()
+    {
+        transaction.execute(
+            "INSERT INTO chunks(page_id, section_id, ordinal, title, heading, text) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![page_id, section_id, ordinal as i64, document.title, document.kind, text],
+        )?;
+    }
+    Ok(())
+}
+
+fn update_code(
+    transaction: &Transaction<'_>,
+    code: &CodeSnapshot,
+) -> Result<(usize, usize, usize)> {
+    let existing = {
+        let mut statement = transaction.prepare(
+            "SELECT ce.kind, ce.entry_id, ce.page_id, p.content_sha256, p.title FROM cache_entries ce JOIN pages p ON p.id = ce.page_id WHERE ce.kind LIKE 'pluginhub/%' OR ce.kind IN ('runelite-api', 'runelite-client')",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                    (
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ),
+                ))
+            })?
+            .collect::<rusqlite::Result<HashMap<_, _>>>()?
+    };
+    let current = code
+        .documents
+        .iter()
+        .map(|document| ((document.kind.clone(), document.id.clone()), document))
+        .collect::<HashMap<_, _>>();
+    let changed = current
+        .iter()
+        .filter(|(key, document)| {
+            existing
+                .get(*key)
+                .is_none_or(|old| old.1 != document.sha256 || old.2 != document.title)
+        })
+        .collect::<Vec<_>>();
+    let removed = existing
+        .iter()
+        .filter(|(key, _)| !current.contains_key(*key))
+        .collect::<Vec<_>>();
+
+    for (_, old) in &removed {
+        delete_page(transaction, old.0)?;
+    }
+    for (key, _) in &changed {
+        if let Some(old) = existing.get(*key) {
+            delete_page(transaction, old.0)?;
+        }
+    }
+    let mut next_id: i64 = transaction.query_row("SELECT min(id) - 1 FROM pages", [], |row| {
+        Ok(row.get::<_, Option<i64>>(0)?.unwrap_or(-1).min(-1))
+    })?;
+    for (key, document) in &changed {
+        let page_id = existing.get(*key).map(|old| old.0).unwrap_or_else(|| {
+            let id = next_id;
+            next_id -= 1;
+            id
+        });
+        insert_code_document(transaction, document, page_id, &code.metadata.indexed_at)?;
+    }
+    for (key, document) in &current {
+        let Some(old) = existing.get(key) else {
+            continue;
+        };
+        if old.1 != document.sha256 || old.2 != document.title {
+            continue;
+        }
+        transaction.execute(
+            "UPDATE pages SET revision_url = ?1, modified_at = ?2, fetched_at = ?3, url = ?4 WHERE id = ?5",
+            params![document.revision_url, document.committed_at, code.metadata.indexed_at, document.url, old.0],
+        )?;
+        transaction.execute(
+            "UPDATE cache_entries SET symbol = ?1, path = ?2, commit_sha = ?3 WHERE page_id = ?4",
+            params![document.symbol, document.path, document.commit, old.0],
+        )?;
+    }
+    let mut metadata = code.metadata.clone();
+    if let Some(stored) = transaction
+        .query_row("SELECT value FROM meta WHERE key = 'code'", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?
+        .map(|value| serde_json::from_str::<CodeMetadata>(&value))
+        .transpose()?
+    {
+        metadata.plugin_repositories = stored.plugin_repositories;
+        metadata.pluginhub_tooling_commit = stored.pluginhub_tooling_commit;
+        metadata.http_api_commit = stored.http_api_commit;
+        metadata.plugin_repository_failures = stored.plugin_repository_failures;
+    }
+    metadata.entries =
+        usize::try_from(
+            transaction.query_row("SELECT count(*) FROM pages", [], |row| row.get::<_, i64>(0))?,
+        )?;
+    transaction.execute(
+        "INSERT INTO meta(key, value) VALUES ('code', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [serde_json::to_string(&metadata)?],
+    )?;
+    Ok((
+        changed.len(),
+        removed.len(),
+        code.documents.len() - changed.len(),
+    ))
+}
+
+fn insert_code_document(
+    transaction: &Transaction<'_>,
+    document: &CodeDocument,
+    page_id: i64,
+    indexed_at: &str,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO pages(id, source_kind, namespace, title, revision_id, revision_url, modified_at, touched_at, fetched_at, url, categories_json, content_sha256, raw_content_zstd) VALUES (?1, 'code', -1, ?2, 0, ?3, ?4, NULL, ?5, ?6, '[]', ?7, X'')",
+        params![page_id, document.title, document.revision_url, document.committed_at, indexed_at, document.url, document.sha256],
+    )?;
+    transaction.execute(
+        "INSERT INTO cache_entries(page_id, kind, entry_id, symbol, path, commit_sha) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![page_id, document.kind, document.id, document.symbol, document.path, document.commit],
     )?;
     transaction.execute(
         "INSERT INTO sections(page_id, section_index, level, heading, content) VALUES (?1, 0, 1, ?2, ?3)",
@@ -745,8 +1180,27 @@ fn validate_search(query: &str, limit: usize) -> Result<()> {
     Ok(())
 }
 
+fn open_optional_database(database: Option<&Path>) -> Result<Option<Connection>> {
+    database
+        .map(|database| {
+            let connection = Connection::open_with_flags(
+                database,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            connection.pragma_update(None, "cache_size", -SQLITE_CACHE_KIB)?;
+            connection.pragma_update(None, "mmap_size", 0)?;
+            Ok::<_, anyhow::Error>(connection)
+        })
+        .transpose()
+}
+
 impl SearchEngine {
-    pub fn open(database: &Path, cache_database: Option<&Path>) -> Result<Self> {
+    pub fn open(
+        database: &Path,
+        cache_database: Option<&Path>,
+        code_database: Option<&Path>,
+    ) -> Result<Self> {
         let connection = Connection::open_with_flags(
             database,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -782,11 +1236,26 @@ impl SearchEngine {
             .transpose()?
             .map(|value| serde_json::from_str(&value))
             .transpose()?;
+        let code_connection = open_optional_database(code_database)?;
+        let code = code_connection
+            .as_ref()
+            .map(|connection| -> Result<String> {
+                Ok(connection.query_row(
+                    "SELECT value FROM meta WHERE key = 'code'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )?)
+            })
+            .transpose()?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?;
         Ok(Self {
             connection,
             cache_connection,
+            code_connection,
             snapshot_date: metadata.snapshot_date,
             cache,
+            code,
         })
     }
 
@@ -810,6 +1279,24 @@ impl SearchEngine {
             bail!("cache kind must be non-empty");
         }
         self.search_source(connection, query, limit, "cache", kind)
+    }
+
+    /// Searches RuneLite and Plugin Hub source files, optionally by module or plugin kind.
+    pub fn search_code(
+        &self,
+        query: &str,
+        limit: usize,
+        kind: Option<&str>,
+    ) -> Result<SearchOutput> {
+        let connection = self
+            .code_connection
+            .as_ref()
+            .ok_or_else(|| anyhow!("code data is not configured"))?;
+        let kind = kind.map(str::trim);
+        if kind == Some("") {
+            bail!("code kind must be non-empty");
+        }
+        self.search_source(connection, query, limit, "code", kind)
     }
 
     /// Searches all indexed Wiki and game-cache content in one ranking.
@@ -1045,31 +1532,55 @@ impl SearchEngine {
 
     /// Returns one exact decoded cache record by the kind and ID from cache search results.
     pub fn cache_entry(&self, kind: &str, id: &str) -> Result<CacheEntryOutput> {
-        if kind.trim().is_empty() || id.trim().is_empty() {
-            bail!("cache entry kind and ID must be non-empty");
-        }
         let connection = self
             .cache_connection
             .as_ref()
             .ok_or_else(|| anyhow!("cache data is not configured"))?;
+        self.repository_entry(connection, "cache", kind, id, false)
+    }
+
+    /// Returns one exact source file by the case-sensitive kind and path from code search results.
+    pub fn code_entry(&self, kind: &str, id: &str) -> Result<CodeEntryOutput> {
+        let connection = self
+            .code_connection
+            .as_ref()
+            .ok_or_else(|| anyhow!("code data is not configured"))?;
+        self.repository_entry(connection, "code", kind, id, true)
+    }
+
+    fn repository_entry(
+        &self,
+        connection: &Connection,
+        source_kind: &str,
+        kind: &str,
+        id: &str,
+        case_sensitive: bool,
+    ) -> Result<CacheEntryOutput> {
+        if kind.trim().is_empty() || id.trim().is_empty() {
+            bail!("{source_kind} entry kind and ID must be non-empty");
+        }
+        let comparison = if case_sensitive {
+            "ce.kind = ?1 AND ce.entry_id = ?2"
+        } else {
+            "ce.kind = ?1 COLLATE NOCASE AND ce.entry_id = ?2 COLLATE NOCASE"
+        };
+        let sql = format!(
+            "SELECT p.id, p.title, p.url, ce.symbol, ce.path, ce.commit_sha, s.content FROM cache_entries ce JOIN pages p ON p.id = ce.page_id JOIN sections s ON s.page_id = p.id AND s.section_index = 0 WHERE {comparison}"
+        );
         let row = connection
-            .query_row(
-                "SELECT p.id, p.title, p.url, ce.symbol, ce.path, ce.commit_sha, s.content FROM cache_entries ce JOIN pages p ON p.id = ce.page_id JOIN sections s ON s.page_id = p.id AND s.section_index = 0 WHERE ce.kind = ?1 COLLATE NOCASE AND ce.entry_id = ?2 COLLATE NOCASE",
-                params![kind.trim(), id.trim()],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                    ))
-                },
-            )
+            .query_row(&sql, params![kind.trim(), id.trim()], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })
             .optional()?
-            .ok_or_else(|| anyhow!("cache entry not found"))?;
+            .ok_or_else(|| anyhow!("{source_kind} entry not found"))?;
         let total_characters = row.6.chars().count();
         let (content, truncated) = cap_chars(&row.6, TEXT_CAP);
         let page = self.page_row_by_id(connection, row.0)?;
@@ -1086,12 +1597,11 @@ impl SearchEngine {
             url: row.2,
             warnings: truncated
                 .then(|| {
-                    "Cache entry truncated at 16,000 characters; use the pinned source URL for the complete record."
-                        .to_string()
+                    format!("{source_kind} entry truncated at 16,000 characters; use the pinned source URL for the complete file.")
                 })
                 .into_iter()
                 .collect(),
-            provenance: self.provenance("cache", vec![source(&page)]),
+            provenance: self.provenance(source_kind, vec![source(&page)]),
         })
     }
 
@@ -1206,6 +1716,19 @@ impl SearchEngine {
                     .unwrap_or("unknown")
                     .to_string(),
             }
+        } else if source_kind == "code" {
+            let code = self.code.as_ref();
+            Provenance {
+                sources,
+                attribution: "RuneLite contributors and individual Plugin Hub authors".to_string(),
+                license: "Per-source repository license".to_string(),
+                license_url: PLUGINHUB_SEARCHER_ORIGIN.to_string(),
+                transformed: true,
+                snapshot_date: code
+                    .and_then(|metadata| metadata.indexed_at.get(..10))
+                    .unwrap_or("unknown")
+                    .to_string(),
+            }
         } else {
             Provenance {
                 sources,
@@ -1282,6 +1805,19 @@ pub fn verify_cache_index(database: &Path) -> Result<()> {
     verify_page_count(&connection, "cache", metadata.entries)
 }
 
+/// Verifies the standalone RuneLite and Plugin Hub source index.
+pub fn verify_code_index(database: &Path) -> Result<()> {
+    let connection =
+        Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    verify_database(&connection)?;
+    let metadata: CodeMetadata = serde_json::from_str(&connection.query_row(
+        "SELECT value FROM meta WHERE key = 'code'",
+        [],
+        |row| row.get::<_, String>(0),
+    )?)?;
+    verify_page_count(&connection, "code", metadata.entries)
+}
+
 fn verify_database(connection: &Connection) -> Result<()> {
     let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     if integrity != "ok" {
@@ -1307,7 +1843,7 @@ fn create_schema(connection: &Connection) -> Result<()> {
          CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
          CREATE TABLE pages(
            id INTEGER PRIMARY KEY,
-           source_kind TEXT NOT NULL CHECK(source_kind IN ('wiki', 'cache')),
+           source_kind TEXT NOT NULL CHECK(source_kind IN ('wiki', 'cache', 'code')),
            namespace INTEGER NOT NULL,
            title TEXT NOT NULL,
            revision_id INTEGER NOT NULL,
@@ -1380,11 +1916,12 @@ fn cap_chars(value: &str, limit: usize) -> (String, bool) {
 
 fn source(page: &PageRow) -> SourceRef {
     SourceRef {
-        kind: if page.source_kind == "wiki" {
-            "page".to_string()
-        } else {
-            "cacheEntry".to_string()
-        },
+        kind: match page.source_kind.as_str() {
+            "wiki" => "page",
+            "code" => "codeFile",
+            _ => "cacheEntry",
+        }
+        .to_string(),
         title: page.title.clone(),
         url: page.url.clone(),
         revision_id: (page.source_kind == "wiki").then_some(page.revision_id),
@@ -1593,12 +2130,123 @@ mod tests {
         drop(wiki);
         drop(cache);
 
-        let engine = SearchEngine::open(&wiki_path, Some(&cache_path)).unwrap();
+        let engine = SearchEngine::open(&wiki_path, Some(&cache_path), None).unwrap();
         let output = engine.search_unified("abyssal whip", 5).unwrap();
         assert_eq!(output.results.len(), 2);
         assert_eq!(output.results[0].title, "Abyssal whip");
         assert!(output.results.iter().any(|row| row.source == "wiki"));
         assert!(output.results.iter().any(|row| row.source == "cache"));
+    }
+
+    #[test]
+    fn java_corpus_migration_removes_plugin_repositories_and_preserves_official_code() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_schema(&connection).unwrap();
+        let base = CodeDocument {
+            kind: "pluginhub/example".to_string(),
+            id: "src/Example.java".to_string(),
+            symbol: "Example.java".to_string(),
+            path: "example/src/Example.java".to_string(),
+            title: "Plugin Hub example: src/Example.java".to_string(),
+            content: "class Example {}".to_string(),
+            sha256: format!("{:x}", Sha256::digest(b"class Example {}")),
+            commit: "0".repeat(40),
+            committed_at: "2026-08-17T00:00:00Z".to_string(),
+            revision_url: String::new(),
+            url: String::new(),
+        };
+        let snapshot = CodeSnapshot {
+            metadata: CodeMetadata {
+                pluginhub_commit: "1".repeat(40),
+                pluginhub_committed_at: String::new(),
+                runelite_commit: "2".repeat(40),
+                runelite_committed_at: String::new(),
+                indexed_at: "2026-08-17T00:00:00Z".to_string(),
+                pluginhub_source_url: String::new(),
+                runelite_source_url: String::new(),
+                plugins: 1,
+                entries: 1,
+                skipped_runelite_files: Vec::new(),
+                plugin_repositories: 0,
+                pluginhub_tooling_commit: None,
+                http_api_commit: None,
+                plugin_repository_failures: Vec::new(),
+            },
+            documents: vec![base],
+        };
+        let transaction = connection.transaction().unwrap();
+        update_code(&transaction, &snapshot).unwrap();
+        transaction.commit().unwrap();
+        let supplemental = CodeDocument {
+            kind: "pluginhub-tooling".to_string(),
+            id: "src/Tool.java".to_string(),
+            symbol: "Tool.java".to_string(),
+            path: "src/Tool.java".to_string(),
+            title: "Plugin Hub tooling: src/Tool.java".to_string(),
+            content: "class Tool {}".to_string(),
+            sha256: format!("{:x}", Sha256::digest(b"class Tool {}")),
+            commit: "0".repeat(40),
+            committed_at: "2026-08-17T00:00:00Z".to_string(),
+            revision_url: String::new(),
+            url: String::new(),
+        };
+        let mut unselected = supplemental.clone();
+        unselected.kind = "pluginrepo/example".to_string();
+        unselected.id = "README.md".to_string();
+        unselected.symbol = "README.md".to_string();
+        unselected.path = "example/README.md".to_string();
+        unselected.title = "Plugin repository example: README.md".to_string();
+        replace_enrichment_kind(
+            &mut connection,
+            "enrich:pluginhub-tooling",
+            "pluginhub-tooling",
+            &"0".repeat(40),
+            &[supplemental],
+            "2026-08-17T00:00:00Z",
+        )
+        .unwrap();
+        replace_enrichment_kind(
+            &mut connection,
+            "pluginrepo:example",
+            "pluginrepo/example",
+            &"0".repeat(40),
+            &[unselected],
+            "2026-08-17T00:00:00Z",
+        )
+        .unwrap();
+        migrate_java_corpus(&mut connection).unwrap();
+
+        let transaction = connection.transaction().unwrap();
+        update_code(&transaction, &snapshot).unwrap();
+        transaction.commit().unwrap();
+
+        let kinds = connection
+            .prepare("SELECT kind FROM cache_entries ORDER BY kind")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(kinds, ["pluginhub-tooling", "pluginhub/example"]);
+        let checkpoint: Option<String> = connection
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'pluginrepo:example'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(checkpoint, None);
+        let metadata: CodeMetadata = serde_json::from_str(
+            &connection
+                .query_row("SELECT value FROM meta WHERE key = 'code'", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata.entries, 2);
+        assert_eq!(metadata.plugin_repositories, 0);
     }
 
     #[test]
