@@ -195,10 +195,7 @@ $BIN code-index \
   --pluginhub-repo pluginhub-searcher \
   --pluginhub-commit "$(git -C pluginhub-searcher rev-parse HEAD)" \
   --runelite-repo runelite \
-  --runelite-commit "$(git -C runelite rev-parse HEAD)"
-
-$BIN code-enrich \
-  --database runelite-code.sqlite \
+  --runelite-commit "$(git -C runelite rev-parse HEAD)" \
   --tooling-repo plugin-hub-tooling \
   --tooling-commit "$(git -C plugin-hub-tooling rev-parse HEAD)" \
   --http-api-repo api.runelite.net \

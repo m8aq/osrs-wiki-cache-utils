@@ -1,12 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
-    io::{BufReader, Read},
+    io::BufReader,
     path::{Path, PathBuf},
     process::Command,
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use flate2::read::GzDecoder;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
@@ -15,8 +15,7 @@ use sha2::{Digest, Sha256};
 
 pub(crate) const PLUGINHUB_SEARCHER_ORIGIN: &str = "https://github.com/JZomDev/pluginhub-searcher";
 pub(crate) const RUNELITE_ORIGIN: &str = "https://github.com/runelite/runelite";
-const MAX_SOURCE_BYTES: u64 = 1024 * 1024;
-type PluginParts = (PathBuf, Vec<String>, Option<HashMap<String, String>>);
+type PluginParts = (PathBuf, Vec<String>, HashMap<String, String>);
 
 #[derive(Debug, Clone)]
 pub(crate) struct CodeDocument {
@@ -45,28 +44,14 @@ pub(crate) struct CodeMetadata {
     pub runelite_source_url: String,
     pub plugins: usize,
     pub entries: usize,
-    pub skipped_runelite_files: Vec<String>,
-    #[serde(default)]
-    pub plugin_repositories: usize,
-    #[serde(default)]
-    pub pluginhub_tooling_commit: Option<String>,
-    #[serde(default)]
-    pub http_api_commit: Option<String>,
-    #[serde(default)]
-    pub plugin_repository_failures: Vec<String>,
+    pub pluginhub_tooling_commit: String,
+    pub http_api_commit: String,
 }
 
 #[derive(Debug)]
 pub(crate) struct CodeSnapshot {
     pub metadata: CodeMetadata,
     pub documents: Vec<CodeDocument>,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum SplitManifest {
-    Current(Vec<SplitDescriptor>),
-    Legacy(Vec<String>),
 }
 
 #[derive(Deserialize)]
@@ -92,27 +77,51 @@ struct PluginFile {
     content: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn read_code_sources(
     pluginhub_root: &Path,
     pluginhub_commit: &str,
     runelite_root: &Path,
     runelite_commit: &str,
+    tooling_root: &Path,
+    tooling_commit: &str,
+    http_api_root: &Path,
+    http_api_commit: &str,
 ) -> Result<CodeSnapshot> {
     let pluginhub_commit =
         validate_checkout(pluginhub_root, pluginhub_commit, "Plugin Hub source")?;
-    let runelite_commit = validate_checkout(runelite_root, runelite_commit, "RuneLite")?;
     let pluginhub_committed_at = git(
         pluginhub_root,
         &["show", "-s", "--format=%cI", &pluginhub_commit],
     )?;
-    let runelite_committed_at = git(
+    let (runelite_commit, runelite_committed_at, runelite) = read_git_java_documents(
         runelite_root,
-        &["show", "-s", "--format=%cI", &runelite_commit],
+        runelite_commit,
+        &["runelite-api", "runelite-client"],
+        None,
+        "RuneLite",
+        RUNELITE_ORIGIN,
+    )?;
+    let (pluginhub_tooling_commit, _, tooling) = read_git_java_documents(
+        tooling_root,
+        tooling_commit,
+        &["."],
+        Some("pluginhub-tooling"),
+        "Plugin Hub tooling",
+        "https://github.com/runelite/plugin-hub-tooling",
+    )?;
+    let (http_api_commit, _, http_api) = read_git_java_documents(
+        http_api_root,
+        http_api_commit,
+        &["http-api"],
+        Some("runelite-http-api"),
+        "RuneLite HTTP API",
+        "https://github.com/runelite/api.runelite.net",
     )?;
     let (mut documents, plugins) = read_pluginhub(pluginhub_root, &pluginhub_committed_at)?;
-    let (runelite, skipped_runelite_files) =
-        read_runelite(runelite_root, &runelite_commit, &runelite_committed_at)?;
     documents.extend(runelite);
+    documents.extend(tooling);
+    documents.extend(http_api);
     documents.sort_by(|left, right| (&left.kind, &left.id).cmp(&(&right.kind, &right.id)));
     if documents.is_empty() {
         bail!("code sources contain no searchable documents");
@@ -128,24 +137,21 @@ pub(crate) fn read_code_sources(
             runelite_source_url: RUNELITE_ORIGIN.to_string(),
             plugins,
             entries: documents.len(),
-            skipped_runelite_files,
-            plugin_repositories: 0,
-            pluginhub_tooling_commit: None,
-            http_api_commit: None,
-            plugin_repository_failures: Vec::new(),
+            pluginhub_tooling_commit,
+            http_api_commit,
         },
         documents,
     })
 }
 
-pub(crate) fn read_git_text_documents(
+fn read_git_java_documents(
     root: &Path,
     expected_commit: &str,
     roots: &[&str],
-    kind: &str,
+    kind: Option<&str>,
     title: &str,
     origin: &str,
-) -> Result<(String, Vec<CodeDocument>)> {
+) -> Result<(String, String, Vec<CodeDocument>)> {
     let commit = validate_checkout(root, expected_commit, title)?;
     let committed_at = git(root, &["show", "-s", "--format=%cI", &commit])?;
     let mut arguments = vec!["ls-tree", "-r", "--name-only", commit.as_str(), "--"];
@@ -159,24 +165,29 @@ pub(crate) fn read_git_text_documents(
         }
         let bytes =
             fs::read(root.join(path)).with_context(|| format!("read {title} file {path}"))?;
-        if bytes.len() as u64 > MAX_SOURCE_BYTES || bytes.contains(&0) {
-            continue;
+        if bytes.contains(&0) {
+            bail!("{title} Java file contains NUL bytes: {path}");
         }
-        let Ok(content) = String::from_utf8(bytes) else {
-            continue;
+        let content = String::from_utf8(bytes)
+            .with_context(|| format!("decode UTF-8 {title} Java file {path}"))?;
+        let kind = kind.unwrap_or_else(|| path.split('/').next().unwrap_or(path));
+        let document_title = if title == "RuneLite" {
+            format!("RuneLite {kind}")
+        } else {
+            title.to_string()
         };
         documents.push(code_document(
             kind,
             path,
             path,
-            title,
+            &document_title,
             content,
             &commit,
             &committed_at,
             origin,
         ));
     }
-    Ok((commit, documents))
+    Ok((commit, committed_at, documents))
 }
 
 fn read_pluginhub(root: &Path, committed_at: &str) -> Result<(Vec<CodeDocument>, usize)> {
@@ -199,9 +210,7 @@ fn read_pluginhub(root: &Path, committed_at: &str) -> Result<(Vec<CodeDocument>,
             {
                 bail!("unsupported plugin repository URL {}", plugin.repository);
             }
-            if let Some(expected) = &expected
-                && expected.get(&plugin.internal_name) != Some(&plugin.commit)
-            {
+            if expected.get(&plugin.internal_name) != Some(&plugin.commit) {
                 bail!(
                     "split manifest commit mismatch for {}",
                     plugin.internal_name
@@ -210,6 +219,9 @@ fn read_pluginhub(root: &Path, committed_at: &str) -> Result<(Vec<CodeDocument>,
             let origin = plugin.repository.trim_end_matches(".git");
             for file in plugin.files {
                 validate_path(&file.file_path)?;
+                if !is_java(&file.file_path) {
+                    continue;
+                }
                 if file.file_name.is_empty()
                     || !keys.insert((plugin.internal_name.clone(), file.file_path.clone()))
                 {
@@ -239,10 +251,7 @@ fn read_pluginhub(root: &Path, committed_at: &str) -> Result<(Vec<CodeDocument>,
             }
         }
     }
-    if expected
-        .as_ref()
-        .is_some_and(|expected| expected.len() != plugins.len())
-    {
+    if expected.len() != plugins.len() {
         bail!("Plugin Hub split manifest and parts contain different plugin counts");
     }
     Ok((documents, plugins.len()))
@@ -251,108 +260,41 @@ fn read_pluginhub(root: &Path, committed_at: &str) -> Result<(Vec<CodeDocument>,
 fn plugin_parts(root: &Path) -> Result<PluginParts> {
     let directory = root.join("plugins");
     let split_path = directory.join("plugins_splits.json");
-    let (parts, expected) = if split_path.exists() {
-        match serde_json::from_reader(BufReader::new(File::open(&split_path)?))
-            .context("parse Plugin Hub split manifest")?
-        {
-            SplitManifest::Current(parts) => {
-                let mut expected = HashMap::new();
-                let names = parts
-                    .into_iter()
-                    .map(|part| {
-                        for (name, commit) in part.content {
-                            if expected.insert(name.clone(), commit).is_some() {
-                                bail!("duplicate plugin {name} in split manifest");
-                            }
-                        }
-                        Ok(part.zipname)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                (names, Some(expected))
-            }
-            SplitManifest::Legacy(parts) => (parts, None),
-        }
-    } else if directory.join("plugins.json").exists() {
-        (vec!["plugins.json".to_string()], None)
-    } else {
-        bail!("Plugin Hub source has neither plugins_splits.json nor plugins.json");
-    };
+    let parts: Vec<SplitDescriptor> = serde_json::from_reader(BufReader::new(
+        File::open(&split_path).context("open Plugin Hub split manifest")?,
+    ))
+    .context("parse Plugin Hub split manifest")?;
     if parts.is_empty() {
         bail!("Plugin Hub split manifest is empty");
     }
-    Ok((directory, parts, expected))
+    let mut expected = HashMap::new();
+    let names = parts
+        .into_iter()
+        .map(|part| {
+            for (name, commit) in part.content {
+                if expected.insert(name.clone(), commit).is_some() {
+                    bail!("duplicate plugin {name} in split manifest");
+                }
+            }
+            Ok(part.zipname)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((directory, names, expected))
 }
 
 fn read_plugin_part(directory: &Path, part: &str) -> Result<Vec<PluginRecord>> {
     validate_path(part)?;
+    if !part.ends_with(".json.gz") {
+        bail!("Plugin Hub part is not gzip JSON: {part}");
+    }
     let path = directory.join(part);
-    let reader: Box<dyn Read> = if part.ends_with(".gz") {
-        Box::new(GzDecoder::new(File::open(&path)?))
-    } else {
-        Box::new(File::open(&path)?)
-    };
-    let records: Vec<PluginRecord> = serde_json::from_reader(BufReader::new(reader))
-        .with_context(|| format!("parse Plugin Hub part {}", path.display()))?;
+    let records: Vec<PluginRecord> =
+        serde_json::from_reader(BufReader::new(GzDecoder::new(File::open(&path)?)))
+            .with_context(|| format!("parse Plugin Hub part {}", path.display()))?;
     if records.is_empty() {
         bail!("Plugin Hub part {part} is empty");
     }
     Ok(records)
-}
-
-fn read_runelite(
-    root: &Path,
-    commit: &str,
-    committed_at: &str,
-) -> Result<(Vec<CodeDocument>, Vec<String>)> {
-    let paths = git(
-        root,
-        &[
-            "ls-tree",
-            "-r",
-            "--name-only",
-            commit,
-            "--",
-            "runelite-api",
-            "runelite-client",
-        ],
-    )?;
-    let mut documents = Vec::new();
-    let mut skipped = Vec::new();
-    for path in paths.lines() {
-        validate_path(path)?;
-        if !is_java(path) {
-            continue;
-        }
-        let bytes =
-            fs::read(root.join(path)).with_context(|| format!("read RuneLite file {path}"))?;
-        if bytes.contains(&0) {
-            skipped.push(path.to_string());
-            continue;
-        }
-        let Ok(content) = String::from_utf8(bytes) else {
-            skipped.push(path.to_string());
-            continue;
-        };
-        let kind = path
-            .split('/')
-            .next()
-            .ok_or_else(|| anyhow!("invalid RuneLite path {path}"))?;
-        let symbol = path.rsplit('/').next().unwrap_or(path);
-        documents.push(CodeDocument {
-            kind: kind.to_string(),
-            id: path.to_string(),
-            symbol: symbol.to_string(),
-            path: path.to_string(),
-            title: format!("RuneLite {kind}: {path}"),
-            sha256: sha256(&content),
-            content,
-            commit: commit.to_string(),
-            committed_at: committed_at.to_string(),
-            revision_url: format!("{RUNELITE_ORIGIN}/commit/{commit}"),
-            url: format!("{RUNELITE_ORIGIN}/blob/{commit}/{}", encode_path(path)),
-        });
-    }
-    Ok((documents, skipped))
 }
 
 #[allow(clippy::too_many_arguments)]

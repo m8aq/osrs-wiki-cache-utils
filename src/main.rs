@@ -11,8 +11,8 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use index::{
-    SearchEngine, build_cache_index, build_code_index, build_index, enrich_code_index,
-    verify_cache_index, verify_code_index, verify_index,
+    SearchEngine, build_cache_index, build_code_index, build_index, verify_cache_index,
+    verify_code_index, verify_index,
 };
 use mcp::OfflineWiki;
 use rmcp::{ServiceExt, transport::stdio};
@@ -66,10 +66,6 @@ enum Command {
         runelite_repo: PathBuf,
         #[arg(long)]
         runelite_commit: String,
-    },
-    CodeEnrich {
-        #[arg(long)]
-        database: PathBuf,
         #[arg(long)]
         tooling_repo: PathBuf,
         #[arg(long)]
@@ -172,21 +168,16 @@ async fn main() -> Result<()> {
             pluginhub_commit,
             runelite_repo,
             runelite_commit,
+            tooling_repo,
+            tooling_commit,
+            http_api_repo,
+            http_api_commit,
         } => build_code_index(
             &database,
             &pluginhub_repo,
             &pluginhub_commit,
             &runelite_repo,
             &runelite_commit,
-        )?,
-        Command::CodeEnrich {
-            database,
-            tooling_repo,
-            tooling_commit,
-            http_api_repo,
-            http_api_commit,
-        } => enrich_code_index(
-            &database,
             &tooling_repo,
             &tooling_commit,
             &http_api_repo,

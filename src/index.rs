@@ -18,7 +18,6 @@ use crate::{
     cache::{CACHE_ORIGIN, CacheDocument, CacheMetadata, CacheSnapshot, read_cache_dump},
     code::{
         CodeDocument, CodeMetadata, CodeSnapshot, PLUGINHUB_SEARCHER_ORIGIN, read_code_sources,
-        read_git_text_documents,
     },
     extract::{chunks_for_section, extract_page},
     model::{AliasManifest, PageManifest, SnapshotMetadata},
@@ -414,18 +413,27 @@ pub fn build_cache_index(database: &Path, cache_dump: &Path, cache_commit: &str)
 }
 
 /// Builds or incrementally updates the standalone RuneLite and Plugin Hub source index.
+#[allow(clippy::too_many_arguments)]
 pub fn build_code_index(
     database: &Path,
     pluginhub_repo: &Path,
     pluginhub_commit: &str,
     runelite_repo: &Path,
     runelite_commit: &str,
+    tooling_repo: &Path,
+    tooling_commit: &str,
+    http_api_repo: &Path,
+    http_api_commit: &str,
 ) -> Result<()> {
     let code = read_code_sources(
         pluginhub_repo,
         pluginhub_commit,
         runelite_repo,
         runelite_commit,
+        tooling_repo,
+        tooling_commit,
+        http_api_repo,
+        http_api_commit,
     )?;
     if database.exists() && current_schema(database, "code")? {
         let mut connection = Connection::open(database)?;
@@ -433,12 +441,7 @@ pub fn build_code_index(
         let counts = update_code(&transaction, &code)?;
         transaction.commit()?;
         connection.execute_batch("PRAGMA optimize;")?;
-        let metadata: CodeMetadata = serde_json::from_str(&connection.query_row(
-            "SELECT value FROM meta WHERE key = 'code'",
-            [],
-            |row| row.get::<_, String>(0),
-        )?)?;
-        verify_page_count(&connection, "code", metadata.entries)?;
+        verify_page_count(&connection, "code", code.documents.len())?;
         eprintln!(
             "code update: {} changed, {} removed, {} unchanged",
             counts.0, counts.1, counts.2
@@ -466,6 +469,8 @@ pub fn build_code_index(
         )?)?;
         if stored.pluginhub_commit != code.metadata.pluginhub_commit
             || stored.runelite_commit != code.metadata.runelite_commit
+            || stored.pluginhub_tooling_commit != code.metadata.pluginhub_tooling_commit
+            || stored.http_api_commit != code.metadata.http_api_commit
         {
             bail!(
                 "partial code index belongs to different source commits; remove {} to rebuild",
@@ -510,193 +515,10 @@ pub fn build_code_index(
     drop(connection);
     fs::rename(&temporary, database)?;
     eprintln!(
-        "code index complete: {} plugins, {} files, {} skipped non-UTF-8 RuneLite files",
+        "code index complete: {} plugins, {} Java files",
         code.metadata.plugins,
-        code.documents.len(),
-        code.metadata.skipped_runelite_files.len()
+        code.documents.len()
     );
-    Ok(())
-}
-
-/// Adds the official Plugin Hub tooling and HTTP API Java sources.
-pub fn enrich_code_index(
-    database: &Path,
-    tooling_repo: &Path,
-    tooling_commit: &str,
-    http_api_repo: &Path,
-    http_api_commit: &str,
-) -> Result<()> {
-    if !current_schema(database, "code")? {
-        bail!("{} is not a current code database", database.display());
-    }
-    let (tooling_commit, tooling) = read_git_text_documents(
-        tooling_repo,
-        tooling_commit,
-        &["."],
-        "pluginhub-tooling",
-        "Plugin Hub tooling",
-        "https://github.com/runelite/plugin-hub-tooling",
-    )?;
-    let (http_api_commit, http_api) = read_git_text_documents(
-        http_api_repo,
-        http_api_commit,
-        &["http-api"],
-        "runelite-http-api",
-        "RuneLite HTTP API",
-        "https://github.com/runelite/api.runelite.net",
-    )?;
-    let indexed_at = chrono::Utc::now().to_rfc3339();
-    let mut connection = Connection::open(database)?;
-    migrate_java_corpus(&mut connection)?;
-    replace_enrichment_kind(
-        &mut connection,
-        "enrich:pluginhub-tooling",
-        "pluginhub-tooling",
-        &tooling_commit,
-        &tooling,
-        &indexed_at,
-    )?;
-    replace_enrichment_kind(
-        &mut connection,
-        "enrich:runelite-http-api",
-        "runelite-http-api",
-        &http_api_commit,
-        &http_api,
-        &indexed_at,
-    )?;
-
-    let mut metadata: CodeMetadata = serde_json::from_str(&connection.query_row(
-        "SELECT value FROM meta WHERE key = 'code'",
-        [],
-        |row| row.get::<_, String>(0),
-    )?)?;
-    metadata.entries =
-        usize::try_from(
-            connection.query_row("SELECT count(*) FROM pages", [], |row| row.get::<_, i64>(0))?,
-        )?;
-    metadata.plugin_repositories = 0;
-    metadata.pluginhub_tooling_commit = Some(tooling_commit);
-    metadata.http_api_commit = Some(http_api_commit);
-    metadata.plugin_repository_failures.clear();
-    metadata.indexed_at = indexed_at;
-    connection.execute(
-        "UPDATE meta SET value = ?1 WHERE key = 'code'",
-        [serde_json::to_string(&metadata)?],
-    )?;
-    connection.execute_batch("PRAGMA optimize;")?;
-    verify_page_count(&connection, "code", metadata.entries)?;
-    eprintln!(
-        "code enrichment complete: {} total Java files",
-        metadata.entries
-    );
-    Ok(())
-}
-
-fn replace_enrichment_kind(
-    connection: &mut Connection,
-    checkpoint: &str,
-    kind: &str,
-    commit: &str,
-    documents: &[CodeDocument],
-    indexed_at: &str,
-) -> Result<()> {
-    let stored: Option<String> = connection
-        .query_row(
-            "SELECT value FROM meta WHERE key = ?1",
-            [checkpoint],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if stored.as_deref() == Some(commit) {
-        return Ok(());
-    }
-    let transaction = connection.transaction()?;
-    let page_ids = {
-        let mut statement =
-            transaction.prepare("SELECT page_id FROM cache_entries WHERE kind = ?1")?;
-        statement
-            .query_map([kind], |row| row.get(0))?
-            .collect::<rusqlite::Result<Vec<i64>>>()?
-    };
-    for page_id in page_ids {
-        delete_page(&transaction, page_id)?;
-    }
-    let mut next_id: i64 = transaction.query_row("SELECT min(id) - 1 FROM pages", [], |row| {
-        Ok(row.get::<_, Option<i64>>(0)?.unwrap_or(-1).min(-1))
-    })?;
-    for document in documents {
-        insert_code_document(&transaction, document, next_id, indexed_at)?;
-        next_id -= 1;
-    }
-    transaction.execute(
-        "INSERT INTO meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![checkpoint, commit],
-    )?;
-    refresh_code_counts(&transaction)?;
-    transaction.commit()?;
-    Ok(())
-}
-
-fn migrate_java_corpus(connection: &mut Connection) -> Result<()> {
-    let obsolete = {
-        let mut statement = connection.prepare(
-            "SELECT ce.page_id, ce.kind, ce.entry_id FROM cache_entries ce WHERE ce.kind LIKE 'pluginrepo/%' OR ce.kind IN ('pluginhub-tooling', 'runelite-http-api')",
-        )?;
-        statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?
-            .filter_map(|row| match row {
-                Ok((page_id, kind, id)) => (kind.starts_with("pluginrepo/")
-                    || !id.to_ascii_lowercase().ends_with(".java"))
-                .then_some(Ok(page_id)),
-                Err(error) => Some(Err(error)),
-            })
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    let transaction = connection.transaction()?;
-    for page_id in &obsolete {
-        delete_page(&transaction, *page_id)?;
-    }
-    transaction.execute("DELETE FROM meta WHERE key LIKE 'pluginrepo:%'", [])?;
-    refresh_code_counts(&transaction)?;
-    transaction.commit()?;
-    if !obsolete.is_empty() {
-        eprintln!(
-            "Java corpus migration: removed {} supplemental files",
-            obsolete.len()
-        );
-    }
-    Ok(())
-}
-
-fn refresh_code_counts(transaction: &Transaction<'_>) -> Result<()> {
-    let Some(value) = transaction
-        .query_row("SELECT value FROM meta WHERE key = 'code'", [], |row| {
-            row.get::<_, String>(0)
-        })
-        .optional()?
-    else {
-        return Ok(());
-    };
-    let mut metadata: CodeMetadata = serde_json::from_str(&value)?;
-    metadata.entries =
-        usize::try_from(
-            transaction.query_row("SELECT count(*) FROM pages", [], |row| row.get::<_, i64>(0))?,
-        )?;
-    metadata.plugin_repositories = usize::try_from(transaction.query_row(
-        "SELECT count(*) FROM meta WHERE key LIKE 'pluginrepo:%'",
-        [],
-        |row| row.get::<_, i64>(0),
-    )?)?;
-    transaction.execute(
-        "UPDATE meta SET value = ?1 WHERE key = 'code'",
-        [serde_json::to_string(&metadata)?],
-    )?;
     Ok(())
 }
 
@@ -883,7 +705,7 @@ fn update_code(
 ) -> Result<(usize, usize, usize)> {
     let existing = {
         let mut statement = transaction.prepare(
-            "SELECT ce.kind, ce.entry_id, ce.page_id, p.content_sha256, p.title FROM cache_entries ce JOIN pages p ON p.id = ce.page_id WHERE ce.kind LIKE 'pluginhub/%' OR ce.kind IN ('runelite-api', 'runelite-client')",
+            "SELECT ce.kind, ce.entry_id, ce.page_id, p.content_sha256, p.title FROM cache_entries ce JOIN pages p ON p.id = ce.page_id",
         )?;
         statement
             .query_map([], |row| {
@@ -951,27 +773,10 @@ fn update_code(
             params![document.symbol, document.path, document.commit, old.0],
         )?;
     }
-    let mut metadata = code.metadata.clone();
-    if let Some(stored) = transaction
-        .query_row("SELECT value FROM meta WHERE key = 'code'", [], |row| {
-            row.get::<_, String>(0)
-        })
-        .optional()?
-        .map(|value| serde_json::from_str::<CodeMetadata>(&value))
-        .transpose()?
-    {
-        metadata.plugin_repositories = stored.plugin_repositories;
-        metadata.pluginhub_tooling_commit = stored.pluginhub_tooling_commit;
-        metadata.http_api_commit = stored.http_api_commit;
-        metadata.plugin_repository_failures = stored.plugin_repository_failures;
-    }
-    metadata.entries =
-        usize::try_from(
-            transaction.query_row("SELECT count(*) FROM pages", [], |row| row.get::<_, i64>(0))?,
-        )?;
+    transaction.execute("DELETE FROM meta WHERE key <> 'code'", [])?;
     transaction.execute(
         "INSERT INTO meta(key, value) VALUES ('code', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [serde_json::to_string(&metadata)?],
+        [serde_json::to_string(&code.metadata)?],
     )?;
     Ok((
         changed.len(),
@@ -1081,22 +886,7 @@ fn insert_aliases(transaction: &Transaction<'_>, aliases: &[AliasManifest]) -> R
 fn current_schema(database: &Path, source_kind: &str) -> Result<bool> {
     let connection = Connection::open(database)?;
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version != 0 && version != SCHEMA_VERSION {
-        return Ok(false);
-    }
-    let compatible = version == SCHEMA_VERSION
-        || connection.query_row(
-            "SELECT
-           (SELECT count(*) FROM pragma_table_info('pages') WHERE name IN ('touched_at', 'source_kind', 'content_sha256', 'raw_content_zstd')) = 4
-           AND (SELECT count(*) FROM pragma_table_info('pages') WHERE name = 'wiki_page_id') = 0
-           AND (SELECT count(*) FROM pragma_table_info('sections') WHERE name = 'parsoid_section_id') = 0
-           AND (SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'cache_entries') = 1
-           AND (SELECT count(*) FROM pragma_index_list('pages') WHERE [unique] = 1) = 0
-           AND (SELECT count(*) FROM pragma_table_info('chunks') WHERE name = 'embedding') = 0",
-            [],
-            |row| row.get(0),
-        )?;
-    if !compatible {
+    if version != SCHEMA_VERSION {
         return Ok(false);
     }
     let other: Option<String> = connection
@@ -1108,10 +898,6 @@ fn current_schema(database: &Path, source_kind: &str) -> Result<bool> {
         .optional()?;
     if let Some(other) = other {
         bail!("database contains {other} data; expected {source_kind}");
-    }
-    if version == 0 {
-        connection.execute("DROP INDEX IF EXISTS pages_source", [])?;
-        connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
     Ok(true)
 }
@@ -1180,19 +966,18 @@ fn validate_search(query: &str, limit: usize) -> Result<()> {
     Ok(())
 }
 
+fn open_database(database: &Path) -> Result<Connection> {
+    let connection = Connection::open_with_flags(
+        database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    connection.pragma_update(None, "cache_size", -SQLITE_CACHE_KIB)?;
+    connection.pragma_update(None, "mmap_size", 0)?;
+    Ok(connection)
+}
+
 fn open_optional_database(database: Option<&Path>) -> Result<Option<Connection>> {
-    database
-        .map(|database| {
-            let connection = Connection::open_with_flags(
-                database,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )?;
-            connection.pragma_update(None, "cache_size", -SQLITE_CACHE_KIB)?;
-            connection.pragma_update(None, "mmap_size", 0)?;
-            Ok::<_, anyhow::Error>(connection)
-        })
-        .transpose()
+    database.map(open_database).transpose()
 }
 
 impl SearchEngine {
@@ -1201,29 +986,13 @@ impl SearchEngine {
         cache_database: Option<&Path>,
         code_database: Option<&Path>,
     ) -> Result<Self> {
-        let connection = Connection::open_with_flags(
-            database,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        connection.pragma_update(None, "cache_size", -SQLITE_CACHE_KIB)?;
-        connection.pragma_update(None, "mmap_size", 0)?;
+        let connection = open_database(database)?;
         let metadata: String =
             connection.query_row("SELECT value FROM meta WHERE key = 'snapshot'", [], |row| {
                 row.get(0)
             })?;
         let metadata: SnapshotMetadata = serde_json::from_str(&metadata)?;
-        let cache_connection = cache_database
-            .map(|database| {
-                let connection = Connection::open_with_flags(
-                    database,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-                )?;
-                connection.pragma_update(None, "cache_size", -SQLITE_CACHE_KIB)?;
-                connection.pragma_update(None, "mmap_size", 0)?;
-                Ok::<_, anyhow::Error>(connection)
-            })
-            .transpose()?;
+        let cache_connection = open_optional_database(cache_database)?;
         let cache = cache_connection
             .as_ref()
             .map(|connection| -> Result<String> {
@@ -2059,26 +1828,6 @@ mod tests {
     }
 
     #[test]
-    fn adopts_current_unversioned_schema() {
-        let root = tempfile::tempdir().unwrap();
-        let database = root.path().join("index.sqlite");
-        let connection = Connection::open(&database).unwrap();
-        create_schema(&connection).unwrap();
-        connection.pragma_update(None, "user_version", 0).unwrap();
-        drop(connection);
-
-        assert!(current_schema(&database, "wiki").unwrap());
-        let connection = Connection::open(&database).unwrap();
-        let version: i64 = connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-        insert_search_fixture(&connection, -1, "cache", "Cache entry");
-        drop(connection);
-        assert!(current_schema(&database, "wiki").is_err());
-    }
-
-    #[test]
     fn unified_search_reads_separate_wiki_and_cache_databases() {
         let root = tempfile::tempdir().unwrap();
         let wiki_path = root.path().join("wiki.sqlite");
@@ -2139,22 +1888,37 @@ mod tests {
     }
 
     #[test]
-    fn java_corpus_migration_removes_plugin_repositories_and_preserves_official_code() {
+    fn code_update_replaces_the_entire_corpus() {
         let mut connection = Connection::open_in_memory().unwrap();
         create_schema(&connection).unwrap();
-        let base = CodeDocument {
-            kind: "pluginhub/example".to_string(),
-            id: "src/Example.java".to_string(),
-            symbol: "Example.java".to_string(),
-            path: "example/src/Example.java".to_string(),
-            title: "Plugin Hub example: src/Example.java".to_string(),
-            content: "class Example {}".to_string(),
-            sha256: format!("{:x}", Sha256::digest(b"class Example {}")),
+        let stale = CodeDocument {
+            kind: "pluginrepo/example".to_string(),
+            id: "README.md".to_string(),
+            symbol: "README.md".to_string(),
+            path: "README.md".to_string(),
+            title: "stale".to_string(),
+            content: "stale".to_string(),
+            sha256: format!("{:x}", Sha256::digest(b"stale")),
             commit: "0".repeat(40),
-            committed_at: "2026-08-17T00:00:00Z".to_string(),
+            committed_at: String::new(),
             revision_url: String::new(),
             url: String::new(),
         };
+        let transaction = connection.transaction().unwrap();
+        insert_code_document(&transaction, &stale, -1, "").unwrap();
+        transaction
+            .execute("INSERT INTO meta VALUES ('pluginrepo:example', 'old')", [])
+            .unwrap();
+        transaction.commit().unwrap();
+
+        let mut current = stale;
+        current.kind = "pluginhub/example".to_string();
+        current.id = "src/Example.java".to_string();
+        current.symbol = "Example.java".to_string();
+        current.path = "example/src/Example.java".to_string();
+        current.title = "Plugin Hub example: src/Example.java".to_string();
+        current.content = "class Example {}".to_string();
+        current.sha256 = format!("{:x}", Sha256::digest(current.content.as_bytes()));
         let snapshot = CodeSnapshot {
             metadata: CodeMetadata {
                 pluginhub_commit: "1".repeat(40),
@@ -2166,87 +1930,22 @@ mod tests {
                 runelite_source_url: String::new(),
                 plugins: 1,
                 entries: 1,
-                skipped_runelite_files: Vec::new(),
-                plugin_repositories: 0,
-                pluginhub_tooling_commit: None,
-                http_api_commit: None,
-                plugin_repository_failures: Vec::new(),
+                pluginhub_tooling_commit: "3".repeat(40),
+                http_api_commit: "4".repeat(40),
             },
-            documents: vec![base],
+            documents: vec![current],
         };
         let transaction = connection.transaction().unwrap();
         update_code(&transaction, &snapshot).unwrap();
         transaction.commit().unwrap();
-        let supplemental = CodeDocument {
-            kind: "pluginhub-tooling".to_string(),
-            id: "src/Tool.java".to_string(),
-            symbol: "Tool.java".to_string(),
-            path: "src/Tool.java".to_string(),
-            title: "Plugin Hub tooling: src/Tool.java".to_string(),
-            content: "class Tool {}".to_string(),
-            sha256: format!("{:x}", Sha256::digest(b"class Tool {}")),
-            commit: "0".repeat(40),
-            committed_at: "2026-08-17T00:00:00Z".to_string(),
-            revision_url: String::new(),
-            url: String::new(),
-        };
-        let mut unselected = supplemental.clone();
-        unselected.kind = "pluginrepo/example".to_string();
-        unselected.id = "README.md".to_string();
-        unselected.symbol = "README.md".to_string();
-        unselected.path = "example/README.md".to_string();
-        unselected.title = "Plugin repository example: README.md".to_string();
-        replace_enrichment_kind(
-            &mut connection,
-            "enrich:pluginhub-tooling",
-            "pluginhub-tooling",
-            &"0".repeat(40),
-            &[supplemental],
-            "2026-08-17T00:00:00Z",
-        )
-        .unwrap();
-        replace_enrichment_kind(
-            &mut connection,
-            "pluginrepo:example",
-            "pluginrepo/example",
-            &"0".repeat(40),
-            &[unselected],
-            "2026-08-17T00:00:00Z",
-        )
-        .unwrap();
-        migrate_java_corpus(&mut connection).unwrap();
-
-        let transaction = connection.transaction().unwrap();
-        update_code(&transaction, &snapshot).unwrap();
-        transaction.commit().unwrap();
-
-        let kinds = connection
-            .prepare("SELECT kind FROM cache_entries ORDER BY kind")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
+        let kind: String = connection
+            .query_row("SELECT kind FROM cache_entries", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(kinds, ["pluginhub-tooling", "pluginhub/example"]);
-        let checkpoint: Option<String> = connection
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'pluginrepo:example'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
+        let metadata_rows: i64 = connection
+            .query_row("SELECT count(*) FROM meta", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(checkpoint, None);
-        let metadata: CodeMetadata = serde_json::from_str(
-            &connection
-                .query_row("SELECT value FROM meta WHERE key = 'code'", [], |row| {
-                    row.get::<_, String>(0)
-                })
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(metadata.entries, 2);
-        assert_eq!(metadata.plugin_repositories, 0);
+        assert_eq!(kind, "pluginhub/example");
+        assert_eq!(metadata_rows, 1);
     }
 
     #[test]

@@ -21,17 +21,9 @@ pub struct SearchRequest {
     pub limit: Option<usize>,
 }
 
-/// Searches decoded cache records, optionally restricting the record kind.
+/// Searches repository records, optionally restricting their kind.
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct CacheSearchRequest {
-    pub query: String,
-    pub limit: Option<usize>,
-    pub kind: Option<String>,
-}
-
-/// Searches source files, optionally restricting the RuneLite module or Plugin Hub plugin.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct CodeSearchRequest {
+pub struct RepositorySearchRequest {
     pub query: String,
     pub limit: Option<usize>,
     pub kind: Option<String>,
@@ -48,16 +40,9 @@ pub struct SectionRequest {
     pub section: i64,
 }
 
-/// Identifies one decoded cache record returned by cache search.
+/// Identifies one repository record returned by search.
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct CacheEntryRequest {
-    pub kind: String,
-    pub id: String,
-}
-
-/// Identifies one case-sensitive source file returned by code search.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct CodeEntryRequest {
+pub struct RepositoryEntryRequest {
     pub kind: String,
     pub id: String,
 }
@@ -120,7 +105,7 @@ impl OfflineWiki {
     )]
     pub async fn search_cache(
         &self,
-        Parameters(request): Parameters<CacheSearchRequest>,
+        Parameters(request): Parameters<RepositorySearchRequest>,
     ) -> Result<Json<SearchOutput>, String> {
         self.with_engine(|engine| {
             engine.search_cache(
@@ -138,7 +123,7 @@ impl OfflineWiki {
     )]
     pub async fn get_cache_entry(
         &self,
-        Parameters(request): Parameters<CacheEntryRequest>,
+        Parameters(request): Parameters<RepositoryEntryRequest>,
     ) -> Result<Json<CacheEntryOutput>, String> {
         self.with_engine(|engine| engine.cache_entry(&request.kind, &request.id))
             .map(Json)
@@ -150,7 +135,7 @@ impl OfflineWiki {
     )]
     pub async fn search_code(
         &self,
-        Parameters(request): Parameters<CodeSearchRequest>,
+        Parameters(request): Parameters<RepositorySearchRequest>,
     ) -> Result<Json<SearchOutput>, String> {
         self.with_engine(|engine| {
             engine.search_code(
@@ -168,7 +153,7 @@ impl OfflineWiki {
     )]
     pub async fn get_code_entry(
         &self,
-        Parameters(request): Parameters<CodeEntryRequest>,
+        Parameters(request): Parameters<RepositoryEntryRequest>,
     ) -> Result<Json<CodeEntryOutput>, String> {
         self.with_engine(|engine| engine.code_entry(&request.kind, &request.id))
             .map(Json)
