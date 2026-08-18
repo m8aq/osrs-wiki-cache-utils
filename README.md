@@ -1,37 +1,48 @@
 # osrs-wiki-cache-utils
 
-Build and search a local copy of the Old School RuneScape Wiki and decoded game
-cache.
+## About
 
-Unlike searching downloaded files with `rg`, this tool understands Wiki page
-sections, nested tables, tabs, titles, and redirects. It packs that structure
-into searchable chunks and ranks matching pages with SQLite FTS5/BM25. Exact
-Wiki titles, redirect aliases, cache symbols, and cache IDs are boosted.
-No embedding model, vector database, or database server is required.
+Search the Old School RuneScape Wiki and decoded game cache entirely offline.
 
-Everything runs offline after the data is built. MCP tools return bounded
-evidence with canonical URLs and revision provenance for a calling agent to
-interpret. The server does not generate answers.
+Unlike `rg`, this tool understands Wiki sections, nested tables, tabs, titles,
+and redirects. SQLite FTS5 ranks the most useful matching sections and cache
+records instead of returning isolated lines from raw files.
+
+Use it from the command line or connect it to an MCP client. No database
+server, embedding model, or answer-generating model is required.
+
+## Why Rust?
+
+Rust keeps large snapshot and indexing jobs fast and memory-conscious. The
+entire tool ships as one executable with no language runtime to install.
 
 ## Quick Start
 
-Prebuilt binaries are available for Apple Silicon macOS, x86-64 Linux, and
-64-bit Windows. On macOS or Linux, download the binary and Wiki database:
+Download the program and prebuilt Wiki database from the
+[latest release](https://github.com/m8aq/osrs-wiki-cache-utils/releases/latest).
+No Rust toolchain or indexing is needed.
+
+### macOS (Apple Silicon)
 
 ```sh
 mkdir -p "$HOME/Documents/osrs" && cd "$HOME/Documents/osrs"
 BASE=https://github.com/m8aq/osrs-wiki-cache-utils/releases/latest/download
-# Linux: replace aarch64-apple-darwin with x86_64-unknown-linux-musl
 curl -fL "$BASE/osrs-wiki-cache-utils-v0.1.0-aarch64-apple-darwin" -o osrs-wiki-cache-utils
 curl -fLO "$BASE/wiki.sqlite"
 chmod +x osrs-wiki-cache-utils
-
-./osrs-wiki-cache-utils search \
-  --database wiki.sqlite \
-  "Blast Furnace coal bag ice gloves"
 ```
 
-On Windows PowerShell:
+### Linux (x86-64)
+
+```sh
+mkdir -p "$HOME/Documents/osrs" && cd "$HOME/Documents/osrs"
+BASE=https://github.com/m8aq/osrs-wiki-cache-utils/releases/latest/download
+curl -fL "$BASE/osrs-wiki-cache-utils-v0.1.0-x86_64-unknown-linux-musl" -o osrs-wiki-cache-utils
+curl -fLO "$BASE/wiki.sqlite"
+chmod +x osrs-wiki-cache-utils
+```
+
+### Windows (64-bit PowerShell)
 
 ```powershell
 New-Item -ItemType Directory -Force "$HOME\Documents\osrs" | Out-Null
@@ -39,10 +50,26 @@ Set-Location "$HOME\Documents\osrs"
 $base = "https://github.com/m8aq/osrs-wiki-cache-utils/releases/latest/download"
 Invoke-WebRequest "$base/osrs-wiki-cache-utils-v0.1.0-x86_64-pc-windows-msvc.exe" -OutFile osrs-wiki-cache-utils.exe
 Invoke-WebRequest "$base/wiki.sqlite" -OutFile wiki.sqlite
-.\osrs-wiki-cache-utils.exe search --database wiki.sqlite "Blast Furnace coal bag ice gloves"
 ```
 
-For decoded game-cache search, also download `cache.sqlite`:
+## Search
+
+Run this from the download directory:
+
+```sh
+./osrs-wiki-cache-utils search --database wiki.sqlite \
+  "Blast Furnace coal bag ice gloves"
+```
+
+On Windows, replace `./osrs-wiki-cache-utils` with
+`.\osrs-wiki-cache-utils.exe`.
+
+Search uses words, titles, IDs, and symbols rather than generated embeddings.
+Short, distinctive queries work best.
+
+### Search the game cache
+
+On macOS or Linux, download the optional cache database and search it:
 
 ```sh
 curl -fLO "$BASE/cache.sqlite"
@@ -54,95 +81,21 @@ curl -fLO "$BASE/cache.sqlite"
   "abyssal whip"
 ```
 
-No Rust toolchain, database server, snapshot, embedding model, or indexing is
-needed. Checksums are available as `SHA256SUMS.txt` in the release.
+On Windows PowerShell:
 
-## Build From Source
-
-Requires Rust. A full Wiki snapshot and index need several gigabytes of disk.
-Progress is printed throughout both operations.
-
-```sh
-cargo build --release
-
-# Fetch revision-pinned Parsoid HTML.
-target/release/osrs-wiki-cache-utils snapshot --output snapshot
-
-# Build the Wiki search database. Interrupted builds resume automatically.
-target/release/osrs-wiki-cache-utils index \
-  --snapshot snapshot \
-  --database wiki.sqlite
+```powershell
+Invoke-WebRequest "$base/cache.sqlite" -OutFile cache.sqlite
+.\osrs-wiki-cache-utils.exe cache-search --database wiki.sqlite --cache-database cache.sqlite --kind config/obj "abyssal whip"
 ```
 
-The snapshot includes current, non-redirect Main and Transcript pages. Pages
-explicitly categorized as historical, removed, obsolete, or discontinued are
-excluded. Raw Parsoid HTML is retained in the snapshot and compressed in the
-Wiki database.
+The cache index covers decoded configs, interfaces, scripts, and symbols. It
+does not include binary assets such as maps, models, sprites, or audio.
 
-## Add Cache Search
-
-The optional cache index reads decoded configs, interfaces, client scripts,
-and symbols from [`Joshua-F/osrs-dumps`](https://github.com/Joshua-F/osrs-dumps).
-Maps, models, sprites, audio, and other binary assets are not indexed.
-
-```sh
-GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 \
-  https://github.com/Joshua-F/osrs-dumps.git cache-dump
-CACHE_COMMIT=$(git -C cache-dump rev-parse HEAD)
-
-target/release/osrs-wiki-cache-utils cache-index \
-  --cache-dump cache-dump \
-  --cache-commit "$CACHE_COMMIT" \
-  --database cache.sqlite
-```
-
-Wiki and cache data use separate databases so either source can be updated or
-distributed independently.
-
-## Search
-
-```sh
-target/release/osrs-wiki-cache-utils search \
-  --database wiki.sqlite \
-  "charged bow ranged strength"
-
-target/release/osrs-wiki-cache-utils cache-search \
-  --database wiki.sqlite \
-  --cache-database cache.sqlite \
-  --kind config/obj \
-  "abyssal whip destroy option"
-
-target/release/osrs-wiki-cache-utils cache-get \
-  --database wiki.sqlite \
-  --cache-database cache.sqlite \
-  config/obj 4151
-```
-
-Search is lexical, so use exact titles or short groups of distinctive terms.
-For example, turn "What equipment makes Blast Furnace runs efficient?" into a
-few focused searches:
-
-```text
-Blast Furnace
-Blast Furnace coal bag ice gloves
-Blast Furnace stamina bar dispenser
-```
-
-Run multiple searches when useful and combine their evidence. For cache data,
-prefer exact IDs, symbols, names, and a `--kind` filter. Generic words such as
-"how", "which", and "minigame" usually add little.
+Checksums for every release download are in `SHA256SUMS.txt`.
 
 ## MCP
 
-Run the stdio server:
-
-```sh
-target/release/osrs-wiki-cache-utils serve \
-  --database /absolute/path/wiki.sqlite \
-  --cache-database /absolute/path/cache.sqlite
-```
-
-MCP client configuration:
+Add the server to an MCP client using absolute paths:
 
 ```json
 {
@@ -159,33 +112,44 @@ MCP client configuration:
 }
 ```
 
-Tools:
+The MCP returns source text and provenance for the client to interpret. It can
+search both databases, retrieve Wiki pages or individual sections, and retrieve
+exact cache records.
 
-- `search_unified`
-- `search_wiki`
-- `get_wiki_page`
-- `get_wiki_sections`
-- `get_wiki_section`
-- `search_cache`
-- `get_cache_entry`
+## Build Your Own Data
 
-`search_cache` accepts an optional kind such as `config/loc`, `config/varbit`,
-`interface`, or `script`.
-
-## Update And Verify
-
-Rerun `snapshot`, `index`, and `cache-index` with the same paths. Unchanged Wiki
-pages and cache records are reused. Interrupted initial builds resume from the
-last committed page or cache batch.
+This requires Rust and several gigabytes of free disk space:
 
 ```sh
-target/release/osrs-wiki-cache-utils verify \
-  --snapshot snapshot \
-  --database wiki.sqlite \
-  --cache-database cache.sqlite
+cargo build --release
+BIN=target/release/osrs-wiki-cache-utils
+
+$BIN snapshot --output snapshot
+$BIN index --snapshot snapshot --database wiki.sqlite
 ```
 
-Wiki content remains under
-[CC BY-NC-SA 3.0](https://creativecommons.org/licenses/by-nc-sa/3.0/) with
-per-revision attribution. Game-cache data has separate provenance and is not
-covered by the Wiki license. This project's source code is MIT licensed.
+The snapshot contains revision-pinned Parsoid HTML from current Main and
+Transcript pages. Raw HTML is preserved. Explicitly historical, removed,
+obsolete, and discontinued pages are excluded.
+
+To build `cache.sqlite` from
+[`Joshua-F/osrs-dumps`](https://github.com/Joshua-F/osrs-dumps):
+
+```sh
+GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 \
+  https://github.com/Joshua-F/osrs-dumps.git cache-dump
+
+$BIN cache-index \
+  --cache-dump cache-dump \
+  --cache-commit "$(git -C cache-dump rev-parse HEAD)" \
+  --database cache.sqlite
+```
+
+Rerun these commands to update the data. Unchanged records are reused, and
+interrupted builds resume automatically.
+
+## License
+
+Wiki content is [CC BY-NC-SA 3.0](https://creativecommons.org/licenses/by-nc-sa/3.0/)
+with per-revision attribution. Game-cache data has separate provenance. The
+source code in this repository is MIT licensed.
