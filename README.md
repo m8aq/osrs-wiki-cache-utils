@@ -22,7 +22,7 @@ Prebuilt binaries are available for Apple Silicon macOS, x86-64 Linux, and
 mkdir -p "$HOME/Documents/osrs" && cd "$HOME/Documents/osrs"
 BASE=https://github.com/m8aq/osrs-wiki-cache-utils/releases/latest/download
 # Linux: replace aarch64-apple-darwin with x86_64-unknown-linux-musl
-curl -fL "$BASE/osrs-wiki-cache-utils-aarch64-apple-darwin" -o osrs-wiki-cache-utils
+curl -fL "$BASE/osrs-wiki-cache-utils-v0.1.0-aarch64-apple-darwin" -o osrs-wiki-cache-utils
 curl -fLO "$BASE/wiki.sqlite"
 chmod +x osrs-wiki-cache-utils
 
@@ -37,7 +37,7 @@ On Windows PowerShell:
 New-Item -ItemType Directory -Force "$HOME\Documents\osrs" | Out-Null
 Set-Location "$HOME\Documents\osrs"
 $base = "https://github.com/m8aq/osrs-wiki-cache-utils/releases/latest/download"
-Invoke-WebRequest "$base/osrs-wiki-cache-utils-x86_64-pc-windows-msvc.exe" -OutFile osrs-wiki-cache-utils.exe
+Invoke-WebRequest "$base/osrs-wiki-cache-utils-v0.1.0-x86_64-pc-windows-msvc.exe" -OutFile osrs-wiki-cache-utils.exe
 Invoke-WebRequest "$base/wiki.sqlite" -OutFile wiki.sqlite
 .\osrs-wiki-cache-utils.exe search --database wiki.sqlite "Blast Furnace coal bag ice gloves"
 ```
@@ -55,7 +55,7 @@ curl -fLO "$BASE/cache.sqlite"
 ```
 
 No Rust toolchain, database server, snapshot, embedding model, or indexing is
-needed. Checksums are available as `SHA256SUMS-v0.1.0.txt` in the release.
+needed. Checksums are available as `SHA256SUMS.txt` in the release.
 
 ## Build From Source
 
