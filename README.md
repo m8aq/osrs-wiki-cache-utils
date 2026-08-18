@@ -13,7 +13,39 @@ Everything runs offline after the data is built. MCP tools return bounded
 evidence with canonical URLs and revision provenance for a calling agent to
 interpret. The server does not generate answers.
 
-## Build
+## Quick Start
+
+The prebuilt release currently supports Apple Silicon macOS. Download the
+binary and ready-to-search Wiki database:
+
+```sh
+mkdir osrs-search && cd osrs-search
+BASE=https://github.com/m8aq/osrs-wiki-cache-utils/releases/latest/download
+curl -fL "$BASE/osrs-wiki-offline-aarch64-apple-darwin" -o osrs-wiki-offline
+curl -fLO "$BASE/wiki.sqlite"
+chmod +x osrs-wiki-offline
+
+./osrs-wiki-offline search \
+  --database wiki.sqlite \
+  "Blast Furnace coal bag ice gloves"
+```
+
+For decoded game-cache search, also download `cache.sqlite`:
+
+```sh
+curl -fLO "$BASE/cache.sqlite"
+
+./osrs-wiki-offline cache-search \
+  --database wiki.sqlite \
+  --cache-database cache.sqlite \
+  --kind config/obj \
+  "abyssal whip"
+```
+
+No Rust toolchain, database server, snapshot, embedding model, or indexing is
+needed. Checksums are available as `SHA256SUMS` in the release.
+
+## Build From Source
 
 Requires Rust. A full Wiki snapshot and index need several gigabytes of disk.
 Progress is printed throughout both operations.
