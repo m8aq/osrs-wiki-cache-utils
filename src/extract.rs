@@ -10,7 +10,7 @@ pub const CHUNK_CHARACTERS: usize = 1_500;
 
 pub fn extract_page(html: &str) -> Result<ExtractedPage> {
     let code = Wikicode::new(html);
-    let categories = extract_categories(&code)?;
+    let categories = extract_categories(&code);
     let mut sections = Vec::new();
     let mut heading_stack: Vec<String> = Vec::new();
 
@@ -146,7 +146,7 @@ pub fn chunks_for_section(title: &str, heading: &str, blocks: &[String]) -> Vec<
     chunks
 }
 
-fn extract_categories(code: &Wikicode) -> Result<Vec<String>> {
+fn extract_categories(code: &Wikicode) -> Vec<String> {
     let mut categories = code
         .select("link[rel=\"mw:PageProp/Category\"]")
         .into_iter()
@@ -161,7 +161,7 @@ fn extract_categories(code: &Wikicode) -> Result<Vec<String>> {
         .collect::<Vec<_>>();
     categories.sort();
     categories.dedup();
-    Ok(categories)
+    categories
 }
 
 fn render_node(node: &Wikinode, blocks: &mut Vec<String>) {

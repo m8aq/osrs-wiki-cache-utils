@@ -14,7 +14,10 @@ use reqwest::{Client, Response, StatusCode};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::{sync::Mutex, time::Instant};
+use tokio::{
+    sync::Mutex,
+    time::{Interval, MissedTickBehavior},
+};
 
 use crate::{
     CONTENT_LICENSE, CONTENT_LICENSE_URL, WIKI_ORIGIN,
@@ -45,23 +48,7 @@ enum FetchOutcome {
 #[derive(Clone)]
 struct WikiHttp {
     client: Client,
-    limiter: Arc<RateLimiter>,
-}
-
-struct RateLimiter {
-    interval: Duration,
-    next: Mutex<Instant>,
-}
-
-impl RateLimiter {
-    async fn wait(&self) {
-        let mut next = self.next.lock().await;
-        let now = Instant::now();
-        if *next > now {
-            tokio::time::sleep_until(*next).await;
-        }
-        *next = Instant::now() + self.interval;
-    }
+    limiter: Arc<Mutex<Interval>>,
 }
 
 impl WikiHttp {
@@ -69,16 +56,17 @@ impl WikiHttp {
         if !requests_per_second.is_finite() || requests_per_second <= 0.0 {
             bail!("requests per second must be greater than zero");
         }
+        let period =
+            Duration::from_secs_f64(1.0 / requests_per_second).max(Duration::from_nanos(1));
+        let mut limiter = tokio::time::interval(period);
+        limiter.set_missed_tick_behavior(MissedTickBehavior::Delay);
         Ok(Self {
             client: Client::builder()
                 .user_agent(USER_AGENT)
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(45))
                 .build()?,
-            limiter: Arc::new(RateLimiter {
-                interval: Duration::from_secs_f64(1.0 / requests_per_second),
-                next: Mutex::new(Instant::now()),
-            }),
+            limiter: Arc::new(Mutex::new(limiter)),
         })
     }
 
@@ -106,7 +94,7 @@ impl WikiHttp {
 
     async fn get(&self, url: &str, params: Option<&[(String, String)]>) -> Result<Response> {
         for attempt in 0..5 {
-            self.limiter.wait().await;
+            self.limiter.lock().await.tick().await;
             let request = self.client.get(url);
             let response = match params {
                 Some(params) => request.query(params),
@@ -539,11 +527,6 @@ pub fn read_json_lines<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Ve
         BufReader::new(File::open(path).with_context(|| format!("open {}", path.display()))?);
     reader
         .lines()
-        .filter(|line| {
-            line.as_ref()
-                .map(|value| !value.trim().is_empty())
-                .unwrap_or(true)
-        })
         .map(|line| Ok(serde_json::from_str(&line?)?))
         .collect()
 }

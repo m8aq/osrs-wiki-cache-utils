@@ -543,9 +543,8 @@ fn insert_cache_document(
 ) -> Result<()> {
     let commit_url = cache_commit_url(&cache.metadata.commit);
     let url = cache_entry_url(&cache.metadata.commit, &document.path);
-    let raw_content = zstd::stream::encode_all(document.content.as_bytes(), 9)?;
     transaction.execute(
-        "INSERT INTO pages(id, source_kind, namespace, title, revision_id, revision_url, modified_at, touched_at, fetched_at, url, categories_json, content_sha256, raw_content_zstd) VALUES (?1, 'cache', -1, ?2, 0, ?3, ?4, NULL, ?5, ?6, '[]', ?7, ?8)",
+        "INSERT INTO pages(id, source_kind, namespace, title, revision_id, revision_url, modified_at, touched_at, fetched_at, url, categories_json, content_sha256, raw_content_zstd) VALUES (?1, 'cache', -1, ?2, 0, ?3, ?4, NULL, ?5, ?6, '[]', ?7, X'')",
         params![
             page_id,
             document.title,
@@ -554,7 +553,6 @@ fn insert_cache_document(
             cache.metadata.indexed_at,
             url,
             document.sha256,
-            raw_content,
         ],
     )?;
     transaction.execute(
@@ -1351,9 +1349,7 @@ fn create_schema(connection: &Connection) -> Result<()> {
            UNIQUE(kind, entry_id)
          );
          CREATE INDEX pages_title ON pages(title COLLATE NOCASE);
-         CREATE INDEX cache_lookup ON cache_entries(kind, entry_id);
          CREATE INDEX chunks_page ON chunks(page_id);
-         CREATE INDEX sections_page ON sections(page_id, section_index);
          CREATE VIRTUAL TABLE chunks_fts USING fts5(title, heading, text, content='chunks', content_rowid='id', tokenize='porter unicode61 remove_diacritics 2');
          CREATE TRIGGER chunks_ai AFTER INSERT ON chunks BEGIN
            INSERT INTO chunks_fts(rowid, title, heading, text) VALUES (new.id, new.title, new.heading, new.text);
