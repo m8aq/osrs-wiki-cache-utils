@@ -79,7 +79,7 @@ impl OfflineWiki {
 impl OfflineWiki {
     #[tool(
         name = "search_unified",
-        description = "Search all available OSRS Wiki and decoded game-cache content in one lexical and semantic ranking. Each result identifies its source."
+        description = "Search all available OSRS Wiki and decoded game-cache content in one BM25 ranking with exact title, alias, symbol, and ID boosts. Each result identifies its source."
     )]
     pub async fn search_unified(
         &self,
@@ -97,7 +97,7 @@ impl OfflineWiki {
 
     #[tool(
         name = "search_wiki",
-        description = "Search the offline Old School RuneScape Wiki snapshot using lexical and semantic retrieval."
+        description = "Search the offline Old School RuneScape Wiki snapshot using stemmed SQLite full-text search with exact title and redirect boosts."
     )]
     pub async fn search_wiki(
         &self,

@@ -9,7 +9,10 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use index::{IndexOptions, SearchEngine, build_index, verify_index};
+use index::{
+    CacheIndexOptions, IndexOptions, SearchEngine, build_cache_index, build_index,
+    verify_cache_index, verify_index,
+};
 use mcp::OfflineWiki;
 use rmcp::{ServiceExt, transport::stdio};
 use snapshot::{SnapshotOptions, build_snapshot, verify_snapshot};
@@ -46,24 +49,24 @@ enum Command {
         snapshot: PathBuf,
         #[arg(long)]
         database: PathBuf,
+    },
+    CacheIndex {
         #[arg(long)]
-        model_cache: PathBuf,
-        #[arg(long, requires = "cache_commit")]
-        cache_dump: Option<PathBuf>,
-        #[arg(long, requires = "cache_dump")]
-        cache_commit: Option<String>,
+        database: PathBuf,
+        #[arg(long)]
+        cache_dump: PathBuf,
+        #[arg(long)]
+        cache_commit: String,
     },
     Serve {
         #[arg(long)]
         database: PathBuf,
         #[arg(long)]
-        model_cache: PathBuf,
+        cache_database: Option<PathBuf>,
     },
     Search {
         #[arg(long)]
         database: PathBuf,
-        #[arg(long)]
-        model_cache: PathBuf,
         query: String,
         #[arg(long, default_value_t = 5)]
         limit: usize,
@@ -72,7 +75,7 @@ enum Command {
         #[arg(long)]
         database: PathBuf,
         #[arg(long)]
-        model_cache: PathBuf,
+        cache_database: PathBuf,
         query: String,
         #[arg(long, default_value_t = 5)]
         limit: usize,
@@ -83,7 +86,7 @@ enum Command {
         #[arg(long)]
         database: PathBuf,
         #[arg(long)]
-        model_cache: PathBuf,
+        cache_database: PathBuf,
         kind: String,
         id: String,
     },
@@ -92,6 +95,8 @@ enum Command {
         snapshot: PathBuf,
         #[arg(long)]
         database: Option<PathBuf>,
+        #[arg(long)]
+        cache_database: Option<PathBuf>,
     },
 }
 
@@ -120,43 +125,40 @@ async fn main() -> Result<()> {
                 metadata.included_pages, metadata.excluded_pages
             );
         }
-        Command::Index {
-            snapshot,
+        Command::Index { snapshot, database } => build_index(IndexOptions { snapshot, database })?,
+        Command::CacheIndex {
             database,
-            model_cache,
             cache_dump,
             cache_commit,
-        } => build_index(IndexOptions {
-            snapshot,
+        } => build_cache_index(CacheIndexOptions {
             database,
-            model_cache,
             cache_dump,
             cache_commit,
         })?,
         Command::Serve {
             database,
-            model_cache,
+            cache_database,
         } => {
-            let server = OfflineWiki::new(SearchEngine::open(&database, &model_cache)?);
+            let server =
+                OfflineWiki::new(SearchEngine::open(&database, cache_database.as_deref())?);
             server.serve(stdio()).await?.waiting().await?;
         }
         Command::Search {
             database,
-            model_cache,
             query,
             limit,
         } => {
-            let output = SearchEngine::open(&database, &model_cache)?.search(&query, limit, 0)?;
+            let output = SearchEngine::open(&database, None)?.search(&query, limit, 0)?;
             println!("{}", serde_json::to_string_pretty(&output)?);
         }
         Command::CacheSearch {
             database,
-            model_cache,
+            cache_database,
             query,
             limit,
             kind,
         } => {
-            let output = SearchEngine::open(&database, &model_cache)?.search_cache(
+            let output = SearchEngine::open(&database, Some(&cache_database))?.search_cache(
                 &query,
                 limit,
                 0,
@@ -166,17 +168,25 @@ async fn main() -> Result<()> {
         }
         Command::CacheGet {
             database,
-            model_cache,
+            cache_database,
             kind,
             id,
         } => {
-            let output = SearchEngine::open(&database, &model_cache)?.cache_entry(&kind, &id)?;
+            let output =
+                SearchEngine::open(&database, Some(&cache_database))?.cache_entry(&kind, &id)?;
             println!("{}", serde_json::to_string_pretty(&output)?);
         }
-        Command::Verify { snapshot, database } => {
+        Command::Verify {
+            snapshot,
+            database,
+            cache_database,
+        } => {
             let metadata = verify_snapshot(&snapshot)?;
             if let Some(database) = database {
-                verify_index(&database)?;
+                verify_index(&database, &snapshot)?;
+            }
+            if let Some(database) = cache_database {
+                verify_cache_index(&database)?;
             }
             eprintln!("verified snapshot {}", metadata.snapshot_date);
         }

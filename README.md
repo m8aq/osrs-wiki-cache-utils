@@ -1,99 +1,106 @@
 # osrs-wiki-cache-utils
 
 Build and search a local copy of the Old School RuneScape Wiki and decoded game
-cache. It parses pages and complex tables into structured chunks, indexes exact
-terms with SQLite FTS5, and generates semantic embeddings locally using
-FastEmbed and BGE-small-en-v1.5. Keyword and meaning-based results are combined
-into one ranking and exposed through CLI and MCP tools.
+cache.
 
-## Quick start
+Unlike searching downloaded files with `rg`, this tool understands Wiki page
+sections, nested tables, tabs, titles, and redirects. It packs that structure
+into searchable chunks and ranks matching pages with SQLite FTS5/BM25. Exact
+Wiki titles, redirect aliases, cache symbols, and cache IDs are boosted.
 
-Requires Rust and about 12 GB of free disk space for a full Wiki build. The
-final Wiki snapshot, index, and model use about 5 GB. Cache data needs
-additional space. Expect the first full build to take several hours.
+Everything runs offline after the data is built. MCP tools return bounded
+evidence with canonical URLs and revision provenance for a calling agent to
+interpret. The server does not generate answers.
+
+## Build
+
+Requires Rust. A full Wiki snapshot and index need several gigabytes of disk.
+Progress is printed throughout both operations.
 
 ```sh
 cargo build --release
 
-# Download current Wiki pages as revision-pinned Parsoid HTML.
+# Fetch revision-pinned Parsoid HTML.
 target/release/osrs-wiki-offline snapshot --output snapshot
 
-# Build the local search index. The embedding model downloads on first use.
+# Build the Wiki search database. Interrupted builds resume automatically.
 target/release/osrs-wiki-offline index \
   --snapshot snapshot \
-  --database index.sqlite \
-  --model-cache model-cache
-
-# Progress is reported by verification, Wiki pages, aliases, and finalization phase.
-
-# Search the Wiki.
-target/release/osrs-wiki-offline search \
-  --database index.sqlite \
-  --model-cache model-cache \
-  "charged bow ranged strength and attack bonus"
+  --database wiki.sqlite
 ```
 
-The snapshot includes current, non-redirect articles and transcripts. Pages
+The snapshot includes current, non-redirect Main and Transcript pages. Pages
 explicitly categorized as historical, removed, obsolete, or discontinued are
-excluded. Raw Parsoid HTML is retained so derived search text is recoverable.
+excluded. Raw Parsoid HTML is retained in the snapshot and compressed in the
+Wiki database.
 
-## Add game-cache search
+## Add Cache Search
 
-The optional cache import reads decoded configs, interfaces, client scripts,
+The optional cache index reads decoded configs, interfaces, client scripts,
 and symbols from [`Joshua-F/osrs-dumps`](https://github.com/Joshua-F/osrs-dumps).
-It skips binary maps, models, sprites, and audio.
+Maps, models, sprites, audio, and other binary assets are not indexed.
 
 ```sh
 GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 \
   https://github.com/Joshua-F/osrs-dumps.git cache-dump
 CACHE_COMMIT=$(git -C cache-dump rev-parse HEAD)
 
-target/release/osrs-wiki-offline index \
-  --snapshot snapshot \
-  --database index.sqlite \
-  --model-cache model-cache \
+target/release/osrs-wiki-offline cache-index \
   --cache-dump cache-dump \
-  --cache-commit "$CACHE_COMMIT"
+  --cache-commit "$CACHE_COMMIT" \
+  --database cache.sqlite
+```
+
+Wiki and cache data use separate databases so either source can be updated or
+distributed independently.
+
+## Search
+
+```sh
+target/release/osrs-wiki-offline search \
+  --database wiki.sqlite \
+  "charged bow ranged strength"
 
 target/release/osrs-wiki-offline cache-search \
-  --database index.sqlite \
-  --model-cache model-cache \
+  --database wiki.sqlite \
+  --cache-database cache.sqlite \
+  --kind config/obj \
   "abyssal whip destroy option"
 
 target/release/osrs-wiki-offline cache-get \
-  --database index.sqlite \
-  --model-cache model-cache \
+  --database wiki.sqlite \
+  --cache-database cache.sqlite \
   config/obj 4151
 ```
 
-## MCP server
+## MCP
 
-Run the stdio server directly:
+Run the stdio server:
 
 ```sh
 target/release/osrs-wiki-offline serve \
-  --database /absolute/path/index.sqlite \
-  --model-cache /absolute/path/model-cache
+  --database /absolute/path/wiki.sqlite \
+  --cache-database /absolute/path/cache.sqlite
 ```
 
-Or add it to an MCP client:
+MCP client configuration:
 
 ```json
 {
   "mcpServers": {
     "osrs": {
-      "command": "/absolute/path/target/release/osrs-wiki-offline",
+      "command": "/absolute/path/osrs-wiki-offline",
       "args": [
         "serve",
-        "--database", "/absolute/path/index.sqlite",
-        "--model-cache", "/absolute/path/model-cache"
+        "--database", "/absolute/path/wiki.sqlite",
+        "--cache-database", "/absolute/path/cache.sqlite"
       ]
     }
   }
 }
 ```
 
-Available tools:
+Tools:
 
 - `search_unified`
 - `search_wiki`
@@ -103,116 +110,20 @@ Available tools:
 - `search_cache`
 - `get_cache_entry`
 
-`search_cache` accepts an optional `kind` such as `config/loc`,
-`config/varbit`, `interface`, or `script`.
+`search_cache` accepts an optional kind such as `config/loc`, `config/varbit`,
+`interface`, or `script`.
 
-### Example: investigate a game mechanic
+## Update And Verify
 
-Suppose a user asks:
-
-> I'm building a Blast Furnace plugin. Which varbits and game objects should I
-> watch for ore on the conveyor belt?
-
-An MCP client can keep the natural question for Wiki context, then translate
-it into focused cache searches:
-
-```json
-[
-  {
-    "tool": "search_wiki",
-    "arguments": {
-      "query": "How does ore move through the Blast Furnace conveyor belt?",
-      "limit": 2
-    }
-  },
-  {
-    "tool": "search_cache",
-    "arguments": {
-      "query": "blast furnace conveyor belt",
-      "kind": "config/loc",
-      "limit": 4
-    }
-  },
-  {
-    "tool": "search_cache",
-    "arguments": {
-      "query": "blast furnace ore",
-      "kind": "config/varbit",
-      "limit": 4
-    }
-  }
-]
-```
-
-A combined, abridged view of the output:
-
-```json
-{
-  "wiki": [
-    {
-      "title": "Blast Furnace/Strategies",
-      "section": "Possible methods",
-      "snippet": "Load coal and/or ore on the conveyor belt ... then load up to 28 ore."
-    },
-    {
-      "title": "Blast Furnace",
-      "section": "Operating the Blast Furnace > Notes",
-      "snippet": "The maximum amount of primary ores ... is 28."
-    }
-  ],
-  "locations": [
-    {
-      "kind": "config/loc",
-      "id": "9101",
-      "symbol": "blast_furnace_conveyer_belt",
-      "snippet": "model=model_9063\nname=Conveyor belt"
-    },
-    {
-      "kind": "config/loc",
-      "id": "9100",
-      "symbol": "blast_furnace_conveyer_belt_clickable",
-      "snippet": "op1=Put-ore-on\nmodel=model_9063\nname=Conveyor belt"
-    }
-  ],
-  "varbits": [
-    {
-      "id": "18167",
-      "symbol": "blast_furnace_lead_ore",
-      "snippet": "basevar=blast_furnace_6\nstartbit=8\nendbit=15"
-    },
-    {
-      "id": "18168",
-      "symbol": "blast_furnace_nickel_ore",
-      "snippet": "basevar=blast_furnace_6\nstartbit=16\nendbit=23"
-    },
-    {
-      "id": "951",
-      "symbol": "blast_furnace_iron_ore",
-      "snippet": "basevar=blast_furnace_3\nstartbit=16\nendbit=23"
-    },
-    {
-      "id": "953",
-      "symbol": "blast_furnace_adamantite_ore",
-      "snippet": "basevar=blast_furnace_4\nstartbit=0\nendbit=7"
-    }
-  ]
-}
-```
-
-Full tool responses also include source URLs, Wiki revision IDs, and the exact
-cache-dump commit.
-
-## Update and verify
-
-Rerun `snapshot` and then `index` with the same paths. Successful pages are
-checkpointed even if another page fails, so unchanged Wiki pages and index
-entries are reused. Include the cache arguments when adding or updating
-game-cache data.
+Rerun `snapshot`, `index`, and `cache-index` with the same paths. Unchanged Wiki
+pages and cache records are reused. Interrupted initial builds resume from the
+last committed page or cache batch.
 
 ```sh
 target/release/osrs-wiki-offline verify \
   --snapshot snapshot \
-  --database index.sqlite
+  --database wiki.sqlite \
+  --cache-database cache.sqlite
 ```
 
 Wiki content remains under

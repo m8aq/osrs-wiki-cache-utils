@@ -1,17 +1,17 @@
 use std::{
-    cmp::{Ordering, Reverse},
-    collections::{BinaryHeap, HashMap, HashSet},
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     process::Command,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use schemars::JsonSchema;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::{
     CONTENT_LICENSE, CONTENT_LICENSE_URL, WIKI_ORIGIN,
@@ -21,53 +21,26 @@ use crate::{
     snapshot::{read_json_lines, verify_snapshot},
 };
 
-const EMBEDDING_DIMENSION: usize = 384;
-const EMBEDDING_BATCH_SIZE: usize = 16;
 const TEXT_CAP: usize = 16_000;
 const SECTION_CAP: usize = 200;
 const CANDIDATE_LIMIT: usize = 50;
 const RRF_K: f32 = 60.0;
+const CACHE_BATCH_SIZE: usize = 1_000;
 const SQLITE_CACHE_KIB: i64 = 32 * 1024;
 const LEXICAL_SQL: &str = "SELECT chunks_fts.rowid FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid JOIN pages p ON p.id = c.page_id LEFT JOIN cache_entries ce ON ce.page_id = p.id WHERE chunks_fts MATCH ?1 AND (?2 IS NULL OR p.source_kind = ?2) AND (?3 IS NULL OR ce.kind = ?3 COLLATE NOCASE) ORDER BY bm25(chunks_fts, 10.0, 4.0, 1.0) LIMIT ?4";
 const RECOVERY_WARNING: &str =
-    "Derived retrieval text; lossless Parsoid HTML is retained in index.sqlite.";
+    "Derived retrieval text; lossless Parsoid HTML is retained in the Wiki database.";
 
 pub struct IndexOptions {
     pub snapshot: PathBuf,
     pub database: PathBuf,
-    pub model_cache: PathBuf,
-    pub cache_dump: Option<PathBuf>,
-    pub cache_commit: Option<String>,
 }
 
-struct LocalEmbedder(TextEmbedding);
-
-impl LocalEmbedder {
-    pub fn open(cache: &Path, progress: bool) -> Result<Self> {
-        fs::create_dir_all(cache)?;
-        let options = TextInitOptions::new(EmbeddingModel::BGESmallENV15Q)
-            .with_cache_dir(cache.to_path_buf())
-            .with_show_download_progress(progress);
-        let model = TextEmbedding::try_new(options).context("load local embedding model")?;
-        write_model_notice(cache)?;
-        Ok(Self(model))
-    }
-
-    fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let prefixed = texts
-            .iter()
-            .map(|text| {
-                if text.starts_with("query: ") {
-                    text.clone()
-                } else {
-                    format!("passage: {text}")
-                }
-            })
-            .collect::<Vec<_>>();
-        self.0
-            .embed(&prefixed, Some(EMBEDDING_BATCH_SIZE))
-            .context("embed text")
-    }
+/// Inputs for building the standalone decoded game-cache search database.
+pub struct CacheIndexOptions {
+    pub database: PathBuf,
+    pub cache_dump: PathBuf,
+    pub cache_commit: String,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -132,14 +105,6 @@ pub struct UnifiedSearchOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_offset: Option<usize>,
     pub provenance: Vec<Provenance>,
-}
-
-struct RankedSearch {
-    results: Vec<SearchResultRow>,
-    total: usize,
-    offset: usize,
-    next_offset: Option<usize>,
-    sources: Vec<SourceRef>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -216,71 +181,33 @@ struct PageRow {
     url: String,
 }
 
-struct PendingCacheChunk {
-    page_id: i64,
-    section_id: i64,
-    ordinal: i64,
-    title: String,
-    heading: String,
-    text: String,
-}
-
 pub struct SearchEngine {
     connection: Connection,
-    embedder: LocalEmbedder,
+    cache_connection: Option<Connection>,
     snapshot_date: String,
     cache: Option<CacheMetadata>,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct SemanticScore {
-    chunk_id: i64,
-    score: f32,
-}
-
-impl PartialEq for SemanticScore {
-    fn eq(&self, other: &Self) -> bool {
-        self.chunk_id == other.chunk_id && self.score.to_bits() == other.score.to_bits()
-    }
-}
-
-impl Eq for SemanticScore {}
-
-impl PartialOrd for SemanticScore {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for SemanticScore {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.score
-            .total_cmp(&other.score)
-            .then_with(|| self.chunk_id.cmp(&other.chunk_id))
-    }
-}
-
 pub fn build_index(options: IndexOptions) -> Result<()> {
-    let cache = match (&options.cache_dump, &options.cache_commit) {
-        (Some(root), Some(commit)) => Some(read_cache_dump(root, commit)?),
-        (None, None) => None,
-        _ => bail!("cache dump and cache commit must be provided together"),
-    };
-    eprintln!("index phase: load embedding model");
-    let mut embedder = LocalEmbedder::open(&options.model_cache, true)?;
+    eprintln!("index phase: verify snapshot");
+    let metadata = verify_snapshot(&options.snapshot)?;
+    let pages: Vec<PageManifest> = read_json_lines(&options.snapshot.join("manifest.jsonl"))?;
+    let aliases: Vec<AliasManifest> = read_json_lines(&options.snapshot.join("aliases.jsonl"))?;
     if options.database.exists() && current_schema(&options.database)? {
         update_index(
             &options.snapshot,
             &options.database,
-            cache.as_ref(),
-            &mut embedder,
+            &metadata,
+            &pages,
+            &aliases,
         )
     } else {
         build_new_index(
             &options.snapshot,
             &options.database,
-            cache.as_ref(),
-            &mut embedder,
+            &metadata,
+            &pages,
+            &aliases,
         )
     }
 }
@@ -288,46 +215,60 @@ pub fn build_index(options: IndexOptions) -> Result<()> {
 fn build_new_index(
     snapshot: &Path,
     database: &Path,
-    cache: Option<&CacheSnapshot>,
-    embedder: &mut LocalEmbedder,
+    metadata: &SnapshotMetadata,
+    pages: &[PageManifest],
+    aliases: &[AliasManifest],
 ) -> Result<()> {
-    eprintln!("index phase: verify snapshot");
-    let metadata = verify_snapshot(snapshot)?;
-    let pages: Vec<PageManifest> = read_json_lines(&snapshot.join("manifest.jsonl"))?;
     let raw_bytes = pages.iter().try_fold(0_u64, |total, page| {
         Ok::<_, anyhow::Error>(total + fs::metadata(snapshot.join(&page.path))?.len())
     })?;
-    require_free_space(database, raw_bytes.saturating_mul(2) + 1024 * 1024 * 1024)?;
+    require_free_space(database, raw_bytes + 512 * 1024 * 1024)?;
     if let Some(parent) = database.parent() {
         fs::create_dir_all(parent)?;
     }
     let temporary = database.with_extension("sqlite.part");
-    let _ = fs::remove_file(&temporary);
     let mut connection = Connection::open(&temporary)?;
-    create_schema(&connection)?;
-    let aliases: Vec<AliasManifest> = read_json_lines(&snapshot.join("aliases.jsonl"))?;
-
-    let transaction = connection.transaction()?;
-    transaction.execute(
-        "INSERT INTO meta(key, value) VALUES ('snapshot', ?1)",
-        [serde_json::to_string(&metadata)?],
-    )?;
-    eprintln!("wiki index: 0/{}", pages.len());
+    if current_schema(&temporary)? {
+        let stored: String =
+            connection.query_row("SELECT value FROM meta WHERE key = 'snapshot'", [], |row| {
+                row.get(0)
+            })?;
+        if stored != serde_json::to_string(metadata)? {
+            bail!(
+                "partial index belongs to another snapshot; remove {} to rebuild",
+                temporary.display()
+            );
+        }
+    } else {
+        drop(connection);
+        let _ = fs::remove_file(&temporary);
+        connection = Connection::open(&temporary)?;
+        create_schema(&connection)?;
+        connection.execute(
+            "INSERT INTO meta(key, value) VALUES ('snapshot', ?1)",
+            [serde_json::to_string(metadata)?],
+        )?;
+    }
+    let existing = indexed_page_ids(&connection, "wiki")?;
+    eprintln!("wiki index: {}/{}", existing.len(), pages.len());
     for (index, page) in pages.iter().enumerate() {
-        insert_page(&transaction, snapshot, page, embedder)?;
+        if !existing.contains(&page.page_id) {
+            let transaction = connection.transaction()?;
+            insert_page(&transaction, snapshot, page)?;
+            transaction.commit()?;
+        }
         let completed = index + 1;
         if completed % 250 == 0 || completed == pages.len() {
             eprintln!("wiki index: {completed}/{}", pages.len());
         }
     }
-    insert_aliases(&transaction, &aliases)?;
-    if let Some(cache) = cache {
-        insert_cache(&transaction, cache, embedder)?;
+    {
+        let transaction = connection.transaction()?;
+        transaction.execute("DELETE FROM aliases", [])?;
+        insert_aliases(&transaction, aliases)?;
+        transaction.commit()?;
     }
-    eprintln!("index phase: commit database");
-    transaction.commit()?;
-    eprintln!("index phase: rebuild full-text index");
-    connection.execute("INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')", [])?;
+    verify_page_count(&connection, "wiki", pages.len())?;
     eprintln!("index phase: optimize database");
     connection.execute_batch("PRAGMA optimize;")?;
     drop(connection);
@@ -339,13 +280,10 @@ fn build_new_index(
 fn update_index(
     snapshot: &Path,
     database: &Path,
-    cache: Option<&CacheSnapshot>,
-    embedder: &mut LocalEmbedder,
+    metadata: &SnapshotMetadata,
+    pages: &[PageManifest],
+    aliases: &[AliasManifest],
 ) -> Result<()> {
-    eprintln!("index phase: verify snapshot");
-    let metadata = verify_snapshot(snapshot)?;
-    let pages: Vec<PageManifest> = read_json_lines(&snapshot.join("manifest.jsonl"))?;
-    let aliases: Vec<AliasManifest> = read_json_lines(&snapshot.join("aliases.jsonl"))?;
     let mut connection = Connection::open(database)?;
     let existing = {
         let mut statement = connection
@@ -385,64 +323,121 @@ fn update_index(
         .copied()
         .collect::<Vec<_>>();
 
-    let transaction = connection.transaction()?;
-    transaction.execute("DELETE FROM aliases", [])?;
-    for page_id in removed
-        .iter()
-        .chain(changed.iter().map(|page| &page.page_id))
-    {
-        transaction.execute("DELETE FROM chunks WHERE page_id = ?1", [page_id])?;
-        transaction.execute("DELETE FROM sections WHERE page_id = ?1", [page_id])?;
-        transaction.execute("DELETE FROM pages WHERE id = ?1", [page_id])?;
+    for page_id in &removed {
+        let transaction = connection.transaction()?;
+        delete_page(&transaction, *page_id)?;
+        transaction.commit()?;
     }
     eprintln!("wiki index update: 0/{}", changed.len());
     for (index, page) in changed.iter().enumerate() {
-        insert_page(&transaction, snapshot, page, embedder)?;
+        let transaction = connection.transaction()?;
+        delete_page(&transaction, page.page_id)?;
+        insert_page(&transaction, snapshot, page)?;
+        transaction.commit()?;
         let completed = index + 1;
         if completed % 250 == 0 || completed == changed.len() {
             eprintln!("wiki index update: {completed}/{}", changed.len());
         }
     }
-    insert_aliases(&transaction, &aliases)?;
-    let cache_counts = cache
-        .map(|cache| update_cache(&transaction, cache, embedder))
-        .transpose()?;
+    let transaction = connection.transaction()?;
+    transaction.execute("DELETE FROM aliases", [])?;
+    insert_aliases(&transaction, aliases)?;
     transaction.execute(
         "INSERT INTO meta(key, value) VALUES ('snapshot', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [serde_json::to_string(&metadata)?],
+        [serde_json::to_string(metadata)?],
     )?;
     transaction.commit()?;
     connection.execute_batch("PRAGMA optimize;")?;
 
-    let indexed: i64 = connection.query_row(
-        "SELECT count(*) FROM pages WHERE source_kind = 'wiki'",
-        [],
-        |row| row.get(0),
-    )?;
-    if indexed != pages.len() as i64 {
-        bail!(
-            "index page count {indexed} does not match snapshot page count {}",
-            pages.len()
-        );
-    }
+    verify_page_count(&connection, "wiki", pages.len())?;
     eprintln!(
         "index update: {} changed, {} removed, {} unchanged",
         changed.len(),
         removed.len(),
         pages.len() - changed.len()
     );
-    if let Some((changed, removed, unchanged)) = cache_counts {
-        eprintln!("cache update: {changed} changed, {removed} removed, {unchanged} unchanged");
-    }
     Ok(())
 }
 
-fn insert_page(
-    transaction: &Transaction<'_>,
-    snapshot: &Path,
-    page: &PageManifest,
-    embedder: &mut LocalEmbedder,
-) -> Result<()> {
+/// Builds or incrementally updates the standalone decoded game-cache index.
+pub fn build_cache_index(options: CacheIndexOptions) -> Result<()> {
+    let cache = read_cache_dump(&options.cache_dump, &options.cache_commit)?;
+    if options.database.exists() && current_schema(&options.database)? {
+        let mut connection = Connection::open(&options.database)?;
+        let transaction = connection.transaction()?;
+        let counts = update_cache(&transaction, &cache)?;
+        transaction.commit()?;
+        connection.execute_batch("PRAGMA optimize;")?;
+        verify_page_count(&connection, "cache", cache.documents.len())?;
+        eprintln!(
+            "cache update: {} changed, {} removed, {} unchanged",
+            counts.0, counts.1, counts.2
+        );
+        return Ok(());
+    }
+
+    if let Some(parent) = options.database.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let required = cache
+        .documents
+        .iter()
+        .map(|document| document.content.len() as u64)
+        .sum::<u64>()
+        .saturating_mul(2);
+    require_free_space(&options.database, required)?;
+    let temporary = options.database.with_extension("sqlite.part");
+    let mut connection = Connection::open(&temporary)?;
+    if current_schema(&temporary)? {
+        let stored: CacheMetadata = serde_json::from_str(&connection.query_row(
+            "SELECT value FROM meta WHERE key = 'cache'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?)?;
+        if stored.commit != cache.metadata.commit {
+            bail!(
+                "partial cache index belongs to commit {}; remove {} to rebuild",
+                stored.commit,
+                temporary.display()
+            );
+        }
+    } else {
+        drop(connection);
+        let _ = fs::remove_file(&temporary);
+        connection = Connection::open(&temporary)?;
+        create_schema(&connection)?;
+        connection.execute(
+            "INSERT INTO meta(key, value) VALUES ('cache', ?1)",
+            [serde_json::to_string(&cache.metadata)?],
+        )?;
+    }
+    let existing = indexed_cache_keys(&connection)?;
+    eprintln!("cache index: {}/{}", existing.len(), cache.documents.len());
+    for (batch_index, batch) in cache.documents.chunks(CACHE_BATCH_SIZE).enumerate() {
+        let transaction = connection.transaction()?;
+        for (offset, document) in batch.iter().enumerate() {
+            if existing.contains(&(document.kind.clone(), document.id.clone())) {
+                continue;
+            }
+            let index = batch_index * CACHE_BATCH_SIZE + offset;
+            insert_cache_document(&transaction, &cache, document, -1 - index as i64)?;
+        }
+        transaction.commit()?;
+        eprintln!(
+            "cache index: {}/{}",
+            ((batch_index + 1) * CACHE_BATCH_SIZE).min(cache.documents.len()),
+            cache.documents.len()
+        );
+    }
+    verify_page_count(&connection, "cache", cache.documents.len())?;
+    connection.execute_batch("PRAGMA optimize;")?;
+    drop(connection);
+    fs::rename(&temporary, &options.database)?;
+    eprintln!("cache index complete: {} entries", cache.documents.len());
+    Ok(())
+}
+
+fn insert_page(transaction: &Transaction<'_>, snapshot: &Path, page: &PageManifest) -> Result<()> {
     let html = fs::read_to_string(snapshot.join(&page.path))?;
     let extracted = extract_page(&html)?;
     let raw_content = zstd::stream::encode_all(html.as_bytes(), 9)?;
@@ -474,38 +469,14 @@ fn insert_page(
             &section.heading,
             &content,
             &section.blocks,
-            embedder,
         )?;
     }
-    Ok(())
-}
-
-fn insert_cache(
-    transaction: &Transaction<'_>,
-    cache: &CacheSnapshot,
-    embedder: &mut LocalEmbedder,
-) -> Result<()> {
-    let mut page_id = -1_i64;
-    let mut pending = Vec::new();
-    for document in &cache.documents {
-        insert_cache_document(transaction, cache, document, page_id, &mut pending)?;
-        if pending.len() >= EMBEDDING_BATCH_SIZE {
-            insert_cache_chunks(transaction, &mut pending, embedder)?;
-        }
-        page_id -= 1;
-    }
-    insert_cache_chunks(transaction, &mut pending, embedder)?;
-    transaction.execute(
-        "INSERT INTO meta(key, value) VALUES ('cache', ?1)",
-        [serde_json::to_string(&cache.metadata)?],
-    )?;
     Ok(())
 }
 
 fn update_cache(
     transaction: &Transaction<'_>,
     cache: &CacheSnapshot,
-    embedder: &mut LocalEmbedder,
 ) -> Result<(usize, usize, usize)> {
     let existing = {
         let mut statement = transaction.prepare(
@@ -553,19 +524,14 @@ fn update_cache(
     let mut next_id: i64 = transaction.query_row("SELECT min(id) - 1 FROM pages", [], |row| {
         Ok(row.get::<_, Option<i64>>(0)?.unwrap_or(-1).min(-1))
     })?;
-    let mut pending = Vec::new();
     for (key, document) in &changed {
         let page_id = existing.get(*key).map(|old| old.0).unwrap_or_else(|| {
             let id = next_id;
             next_id -= 1;
             id
         });
-        insert_cache_document(transaction, cache, document, page_id, &mut pending)?;
-        if pending.len() >= EMBEDDING_BATCH_SIZE {
-            insert_cache_chunks(transaction, &mut pending, embedder)?;
-        }
+        insert_cache_document(transaction, cache, document, page_id)?;
     }
-    insert_cache_chunks(transaction, &mut pending, embedder)?;
 
     let commit_url = cache_commit_url(&cache.metadata.commit);
     for (key, document) in &current {
@@ -607,7 +573,6 @@ fn insert_cache_document(
     cache: &CacheSnapshot,
     document: &CacheDocument,
     page_id: i64,
-    pending: &mut Vec<PendingCacheChunk>,
 ) -> Result<()> {
     let commit_url = cache_commit_url(&cache.metadata.commit);
     let url = cache_entry_url(&cache.metadata.commit, &document.path);
@@ -639,43 +604,13 @@ fn insert_cache_document(
         .lines()
         .map(str::to_string)
         .collect::<Vec<_>>();
-    pending.extend(
-        chunks_for_section(&document.title, &document.kind, &blocks)
-            .into_iter()
-            .enumerate()
-            .map(|(ordinal, text)| PendingCacheChunk {
-                page_id,
-                section_id,
-                ordinal: ordinal as i64,
-                title: document.title.clone(),
-                heading: document.kind.clone(),
-                text,
-            }),
-    );
-    Ok(())
-}
-
-fn insert_cache_chunks(
-    transaction: &Transaction<'_>,
-    pending: &mut Vec<PendingCacheChunk>,
-    embedder: &mut LocalEmbedder,
-) -> Result<()> {
-    if pending.is_empty() {
-        return Ok(());
-    }
-    let texts = pending
-        .iter()
-        .map(|chunk| chunk.text.clone())
-        .collect::<Vec<_>>();
-    let mut vectors = embedder.embed(&texts)?;
-    if vectors.len() != pending.len() {
-        bail!("cache embedding count mismatch");
-    }
-    for (chunk, vector) in pending.drain(..).zip(vectors.iter_mut()) {
-        normalize(vector)?;
+    for (ordinal, text) in chunks_for_section(&document.title, &document.kind, &blocks)
+        .into_iter()
+        .enumerate()
+    {
         transaction.execute(
-            "INSERT INTO chunks(page_id, section_id, ordinal, title, heading, text, embedding) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![chunk.page_id, chunk.section_id, chunk.ordinal, chunk.title, chunk.heading, chunk.text, vector_bytes(vector)],
+            "INSERT INTO chunks(page_id, section_id, ordinal, title, heading, text) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![page_id, section_id, ordinal as i64, document.title, document.kind, text],
         )?;
     }
     Ok(())
@@ -691,7 +626,6 @@ fn insert_section(
     heading: &str,
     content: &str,
     blocks: &[String],
-    embedder: &mut LocalEmbedder,
 ) -> Result<()> {
     transaction.execute(
         "INSERT INTO sections(page_id, section_index, level, heading, content) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -699,15 +633,10 @@ fn insert_section(
     )?;
     let section_id = transaction.last_insert_rowid();
     let texts = chunks_for_section(title, heading, blocks);
-    let mut vectors = embedder.embed(&texts)?;
-    if vectors.len() != texts.len() {
-        bail!("embedding count mismatch for {title}");
-    }
-    for (ordinal, (text, vector)) in texts.into_iter().zip(vectors.iter_mut()).enumerate() {
-        normalize(vector)?;
+    for (ordinal, text) in texts.into_iter().enumerate() {
         transaction.execute(
-            "INSERT INTO chunks(page_id, section_id, ordinal, title, heading, text, embedding) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![page_id, section_id, ordinal as i64, title, heading, text, vector_bytes(vector)],
+            "INSERT INTO chunks(page_id, section_id, ordinal, title, heading, text) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![page_id, section_id, ordinal as i64, title, heading, text],
         )?;
     }
     Ok(())
@@ -771,7 +700,42 @@ fn current_schema(database: &Path) -> Result<bool> {
         [],
         |row| row.get(0),
     )?;
-    Ok(required == 4 && redundant == 0 && cache_entries == 1 && unique_page_indexes == 0)
+    let embedding_columns: i64 = connection.query_row(
+        "SELECT count(*) FROM pragma_table_info('chunks') WHERE name = 'embedding'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(required == 4
+        && redundant == 0
+        && cache_entries == 1
+        && unique_page_indexes == 0
+        && embedding_columns == 0)
+}
+
+fn indexed_page_ids(connection: &Connection, source_kind: &str) -> Result<HashSet<i64>> {
+    let mut statement = connection.prepare("SELECT id FROM pages WHERE source_kind = ?1")?;
+    Ok(statement
+        .query_map([source_kind], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+fn indexed_cache_keys(connection: &Connection) -> Result<HashSet<(String, String)>> {
+    let mut statement = connection.prepare("SELECT kind, entry_id FROM cache_entries")?;
+    Ok(statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+fn verify_page_count(connection: &Connection, source_kind: &str, expected: usize) -> Result<()> {
+    let indexed: i64 = connection.query_row(
+        "SELECT count(*) FROM pages WHERE source_kind = ?1",
+        [source_kind],
+        |row| row.get(0),
+    )?;
+    if indexed != expected as i64 {
+        bail!("{source_kind} page count {indexed} does not match expected count {expected}");
+    }
+    Ok(())
 }
 
 fn require_free_space(path: &Path, required: u64) -> Result<()> {
@@ -809,8 +773,15 @@ fn parse_df_available(output: &str) -> Option<u64> {
         .map(|kilobytes| kilobytes * 1024)
 }
 
+fn validate_search(query: &str, limit: usize) -> Result<()> {
+    if query.trim().is_empty() || limit == 0 || limit > 20 {
+        bail!("query must be non-empty and limit must be between 1 and 20");
+    }
+    Ok(())
+}
+
 impl SearchEngine {
-    pub fn open(database: &Path, model_cache: &Path) -> Result<Self> {
+    pub fn open(database: &Path, cache_database: Option<&Path>) -> Result<Self> {
         let connection = Connection::open_with_flags(
             database,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -822,35 +793,52 @@ impl SearchEngine {
                 row.get(0)
             })?;
         let metadata: SnapshotMetadata = serde_json::from_str(&metadata)?;
-        let cache = connection
-            .query_row("SELECT value FROM meta WHERE key = 'cache'", [], |row| {
-                row.get::<_, String>(0)
+        let cache_connection = cache_database
+            .map(|database| {
+                let connection = Connection::open_with_flags(
+                    database,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )?;
+                connection.pragma_update(None, "cache_size", -SQLITE_CACHE_KIB)?;
+                connection.pragma_update(None, "mmap_size", 0)?;
+                Ok::<_, anyhow::Error>(connection)
             })
-            .optional()?
+            .transpose()?;
+        let cache = cache_connection
+            .as_ref()
+            .map(|connection| -> Result<String> {
+                Ok(connection.query_row(
+                    "SELECT value FROM meta WHERE key = 'cache'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )?)
+            })
+            .transpose()?
             .map(|value| serde_json::from_str(&value))
             .transpose()?;
         Ok(Self {
             connection,
-            embedder: LocalEmbedder::open(model_cache, false)?,
+            cache_connection,
             snapshot_date: metadata.snapshot_date,
             cache,
         })
     }
 
-    pub fn search(&mut self, query: &str, limit: usize, offset: usize) -> Result<SearchOutput> {
+    pub fn search(&self, query: &str, limit: usize, offset: usize) -> Result<SearchOutput> {
         self.search_source(query, limit, offset, "wiki", None)
     }
 
     /// Searches decoded, revision-pinned game-cache records, optionally by kind.
     pub fn search_cache(
-        &mut self,
+        &self,
         query: &str,
         limit: usize,
         offset: usize,
         kind: Option<&str>,
     ) -> Result<SearchOutput> {
         if self.cache.is_none() {
-            bail!("cache data is not present in this index");
+            bail!("cache data is not configured");
         }
         let kind = kind.map(str::trim);
         if kind == Some("") {
@@ -861,91 +849,131 @@ impl SearchEngine {
 
     /// Searches all indexed Wiki and game-cache content in one ranking.
     pub fn search_unified(
-        &mut self,
+        &self,
         query: &str,
         limit: usize,
         offset: usize,
     ) -> Result<UnifiedSearchOutput> {
-        let ranked = self.search_ranked(query, limit, offset, None, None)?;
-        let (wiki, cache): (Vec<_>, Vec<_>) = ranked
-            .sources
+        validate_search(query, limit)?;
+        let wiki = self.rank_rows(&self.connection, query, "wiki", None)?;
+        let cache = self
+            .cache_connection
+            .as_ref()
+            .map(|connection| self.rank_rows(connection, query, "cache", None))
+            .transpose()?
+            .unwrap_or_default();
+        let mut rows = wiki.into_iter().chain(cache).collect::<Vec<_>>();
+        rows.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.source.cmp(&right.source))
+                .then_with(|| left.title.cmp(&right.title))
+        });
+        let total = rows.len();
+        let results = rows
             .into_iter()
-            .partition(|source| source.kind == "page");
+            .skip(offset)
+            .take(limit)
+            .collect::<Vec<_>>();
+        let next_offset = (offset + results.len() < total).then_some(offset + results.len());
+        let (wiki_rows, cache_rows): (Vec<_>, Vec<_>) =
+            results.iter().partition(|row| row.source == "wiki");
+        let wiki_sources = wiki_rows
+            .into_iter()
+            .map(|row| {
+                self.page_row_by_id(&self.connection, row.page_id)
+                    .map(|page| source(&page))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let cache_sources = cache_rows
+            .into_iter()
+            .map(|row| {
+                self.page_row_by_id(
+                    self.cache_connection
+                        .as_ref()
+                        .expect("cache result needs database"),
+                    row.page_id,
+                )
+                .map(|page| source(&page))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let provenance = [
-            (!wiki.is_empty()).then(|| self.provenance("wiki", wiki)),
-            (!cache.is_empty()).then(|| self.provenance("cache", cache)),
+            (!wiki_sources.is_empty()).then(|| self.provenance("wiki", wiki_sources)),
+            (!cache_sources.is_empty()).then(|| self.provenance("cache", cache_sources)),
         ]
         .into_iter()
         .flatten()
         .collect();
         Ok(UnifiedSearchOutput {
-            results: ranked.results,
-            total: ranked.total,
-            offset: ranked.offset,
-            next_offset: ranked.next_offset,
+            results,
+            total,
+            offset,
+            next_offset,
             provenance,
         })
     }
 
     fn search_source(
-        &mut self,
+        &self,
         query: &str,
         limit: usize,
         offset: usize,
         source_kind: &str,
         cache_kind: Option<&str>,
     ) -> Result<SearchOutput> {
-        let ranked = self.search_ranked(query, limit, offset, Some(source_kind), cache_kind)?;
+        validate_search(query, limit)?;
+        let connection = if source_kind == "wiki" {
+            &self.connection
+        } else {
+            self.cache_connection
+                .as_ref()
+                .ok_or_else(|| anyhow!("cache data is not configured"))?
+        };
+        let rows = self.rank_rows(connection, query, source_kind, cache_kind)?;
+        let total = rows.len();
+        let results = rows
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect::<Vec<_>>();
+        let next_offset = (offset + results.len() < total).then_some(offset + results.len());
+        let sources = results
+            .iter()
+            .map(|row| {
+                self.page_row_by_id(connection, row.page_id)
+                    .map(|page| source(&page))
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(SearchOutput {
-            results: ranked.results,
-            total: ranked.total,
-            offset: ranked.offset,
-            next_offset: ranked.next_offset,
-            provenance: self.provenance(source_kind, ranked.sources),
+            results,
+            total,
+            offset,
+            next_offset,
+            provenance: self.provenance(source_kind, sources),
         })
     }
 
-    fn search_ranked(
-        &mut self,
+    fn rank_rows(
+        &self,
+        connection: &Connection,
         query: &str,
-        limit: usize,
-        offset: usize,
-        source_kind: Option<&str>,
+        source_kind: &str,
         cache_kind: Option<&str>,
-    ) -> Result<RankedSearch> {
+    ) -> Result<Vec<SearchResultRow>> {
         let query = query.trim();
-        if query.is_empty() || limit == 0 || limit > 20 {
-            bail!("query must be non-empty and limit must be between 1 and 20");
-        }
-        let lexical = self.lexical_candidates(query, source_kind, cache_kind)?;
-        let semantic = self.semantic_candidates(query, source_kind, cache_kind)?;
-        let exact_pages: Vec<i64> = match source_kind {
-            Some(source_kind) => self
-                .resolve_page_id(query, source_kind, cache_kind)?
-                .into_iter()
-                .collect(),
-            None => [
-                self.resolve_page_id(query, "wiki", None)?,
-                self.cache
-                    .is_some()
-                    .then(|| self.resolve_page_id(query, "cache", None))
-                    .transpose()?
-                    .flatten(),
-            ]
+        let lexical = self.lexical_candidates(connection, query, source_kind, cache_kind)?;
+        let exact_pages = self
+            .resolve_page_id(connection, query, source_kind, cache_kind)?
             .into_iter()
-            .flatten()
-            .collect(),
-        };
+            .collect::<Vec<_>>();
         let mut scores: HashMap<i64, f32> = HashMap::new();
         for (rank, chunk_id) in lexical.iter().enumerate() {
             *scores.entry(*chunk_id).or_default() += 1.0 / (RRF_K + rank as f32 + 1.0);
         }
-        for (rank, chunk_id) in semantic.iter().enumerate() {
-            *scores.entry(*chunk_id).or_default() += 1.0 / (RRF_K + rank as f32 + 1.0);
-        }
         for page_id in exact_pages {
-            let chunk_id: Option<i64> = self
-                .connection
+            let chunk_id: Option<i64> = connection
                 .query_row(
                     "SELECT id FROM chunks WHERE page_id = ?1 ORDER BY id LIMIT 1",
                     [page_id],
@@ -962,7 +990,7 @@ impl SearchEngine {
         let mut seen_pages = HashSet::new();
         let mut rows = Vec::new();
         for (chunk_id, score) in ranked {
-            let row = self.connection.query_row(
+            let row = connection.query_row(
                 "SELECT p.id, p.source_kind, p.title, p.url, s.heading, c.text, ce.kind, ce.entry_id, ce.symbol FROM chunks c JOIN pages p ON p.id = c.page_id JOIN sections s ON s.id = c.section_id LEFT JOIN cache_entries ce ON ce.page_id = p.id WHERE c.id = ?1",
                 [chunk_id],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, Option<String>>(6)?, row.get::<_, Option<String>>(7)?, row.get::<_, Option<String>>(8)?)),
@@ -982,29 +1010,12 @@ impl SearchEngine {
                 });
             }
         }
-        let total = rows.len();
-        let results = rows
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .collect::<Vec<_>>();
-        let next_offset = (offset + results.len() < total).then_some(offset + results.len());
-        let sources = results
-            .iter()
-            .map(|row| self.page_row_by_id(row.page_id).map(|page| source(&page)))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(RankedSearch {
-            results,
-            total,
-            offset,
-            next_offset,
-            sources,
-        })
+        Ok(rows)
     }
 
     pub fn page(&self, title: &str) -> Result<PageOutput> {
         let page = self.page_row(title)?;
-        let sections = self.section_rows(page.id)?;
+        let sections = self.section_rows(&self.connection, page.id)?;
         let content = sections
             .iter()
             .map(|(_, _, heading, content)| format!("## {heading}\n\n{content}"))
@@ -1043,7 +1054,7 @@ impl SearchEngine {
 
     pub fn sections(&self, title: &str) -> Result<SectionsOutput> {
         let page = self.page_row(title)?;
-        let rows = self.section_rows(page.id)?;
+        let rows = self.section_rows(&self.connection, page.id)?;
         let total = rows.len();
         let sections = rows
             .into_iter()
@@ -1103,8 +1114,11 @@ impl SearchEngine {
         if kind.trim().is_empty() || id.trim().is_empty() {
             bail!("cache entry kind and ID must be non-empty");
         }
-        let row = self
-            .connection
+        let connection = self
+            .cache_connection
+            .as_ref()
+            .ok_or_else(|| anyhow!("cache data is not configured"))?;
+        let row = connection
             .query_row(
                 "SELECT p.id, p.title, p.url, ce.symbol, ce.path, ce.commit_sha, s.content FROM cache_entries ce JOIN pages p ON p.id = ce.page_id JOIN sections s ON s.page_id = p.id AND s.section_index = 0 WHERE ce.kind = ?1 COLLATE NOCASE AND ce.entry_id = ?2 COLLATE NOCASE",
                 params![kind.trim(), id.trim()],
@@ -1124,7 +1138,7 @@ impl SearchEngine {
             .ok_or_else(|| anyhow!("cache entry not found"))?;
         let total_characters = row.6.chars().count();
         let (content, truncated) = cap_chars(&row.6, TEXT_CAP);
-        let page = self.page_row_by_id(row.0)?;
+        let page = self.page_row_by_id(connection, row.0)?;
         Ok(CacheEntryOutput {
             kind: kind.trim().to_string(),
             id: id.trim().to_string(),
@@ -1149,15 +1163,16 @@ impl SearchEngine {
 
     fn lexical_candidates(
         &self,
+        connection: &Connection,
         query: &str,
-        source_kind: Option<&str>,
+        source_kind: &str,
         cache_kind: Option<&str>,
     ) -> Result<Vec<i64>> {
         let query = fts_query(query);
         if query.is_empty() {
             return Ok(Vec::new());
         }
-        let mut statement = self.connection.prepare(LEXICAL_SQL)?;
+        let mut statement = connection.prepare(LEXICAL_SQL)?;
         Ok(statement
             .query_map(
                 params![query, source_kind, cache_kind, CANDIDATE_LIMIT as i64],
@@ -1166,48 +1181,9 @@ impl SearchEngine {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    fn semantic_candidates(
-        &mut self,
-        query: &str,
-        source_kind: Option<&str>,
-        cache_kind: Option<&str>,
-    ) -> Result<Vec<i64>> {
-        let mut vectors = self.embedder.embed(&[format!("query: {query}")])?;
-        let vector = vectors
-            .first_mut()
-            .ok_or_else(|| anyhow!("embedding model returned no query vector"))?;
-        normalize(vector)?;
-        let mut statement = self
-            .connection
-            .prepare("SELECT c.id, c.embedding FROM chunks c JOIN pages p ON p.id = c.page_id LEFT JOIN cache_entries ce ON ce.page_id = p.id WHERE (?1 IS NULL OR p.source_kind = ?1) AND (?2 IS NULL OR ce.kind = ?2 COLLATE NOCASE)")?;
-        let mut rows = statement.query(params![source_kind, cache_kind])?;
-        let mut best = BinaryHeap::with_capacity(CANDIDATE_LIMIT + 1);
-        // ponytail: stream the exact scan to bound RAM; add ANN only if full-corpus p95 exceeds 500 ms.
-        while let Some(row) = rows.next()? {
-            let candidate = SemanticScore {
-                chunk_id: row.get(0)?,
-                score: dot_bytes(vector, row.get_ref(1)?.as_blob()?)?,
-            };
-            if best.len() < CANDIDATE_LIMIT {
-                best.push(Reverse(candidate));
-            } else if candidate > best.peek().expect("non-empty candidate heap").0 {
-                best.pop();
-                best.push(Reverse(candidate));
-            }
-        }
-        let mut best = best
-            .into_iter()
-            .map(|candidate| candidate.0)
-            .collect::<Vec<_>>();
-        best.sort_by(|left, right| right.cmp(left));
-        Ok(best
-            .into_iter()
-            .map(|candidate| candidate.chunk_id)
-            .collect())
-    }
-
     fn resolve_page_id(
         &self,
+        connection: &Connection,
         title: &str,
         source_kind: &str,
         cache_kind: Option<&str>,
@@ -1215,15 +1191,15 @@ impl SearchEngine {
         let sql = if source_kind == "wiki" {
             "SELECT id FROM (SELECT id, CASE WHEN title = ?1 THEN 0 ELSE 1 END AS priority FROM pages WHERE source_kind = 'wiki' AND title = ?1 COLLATE NOCASE UNION ALL SELECT a.page_id, 2 FROM aliases a JOIN pages p ON p.id = a.page_id WHERE p.source_kind = 'wiki' AND a.alias = ?1 COLLATE NOCASE) ORDER BY priority LIMIT 1"
         } else {
-            "SELECT p.id FROM pages p JOIN cache_entries ce ON ce.page_id = p.id WHERE p.source_kind = 'cache' AND (p.title = ?1 COLLATE NOCASE OR ce.symbol = ?1 COLLATE NOCASE) AND (?2 IS NULL OR ce.kind = ?2 COLLATE NOCASE) LIMIT 1"
+            "SELECT p.id FROM pages p JOIN cache_entries ce ON ce.page_id = p.id WHERE p.source_kind = 'cache' AND (p.title = ?1 COLLATE NOCASE OR ce.symbol = ?1 COLLATE NOCASE OR ce.entry_id = ?1 COLLATE NOCASE) AND (?2 IS NULL OR ce.kind = ?2 COLLATE NOCASE) LIMIT 1"
         };
         if source_kind == "wiki" {
-            self.connection
+            connection
                 .query_row(sql, [title], |row| row.get(0))
                 .optional()
                 .map_err(Into::into)
         } else {
-            self.connection
+            connection
                 .query_row(sql, params![title, cache_kind], |row| row.get(0))
                 .optional()
                 .map_err(Into::into)
@@ -1232,13 +1208,13 @@ impl SearchEngine {
 
     fn page_row(&self, title: &str) -> Result<PageRow> {
         let page_id = self
-            .resolve_page_id(title, "wiki", None)?
+            .resolve_page_id(&self.connection, title, "wiki", None)?
             .ok_or_else(|| anyhow!("page not found"))?;
-        self.page_row_by_id(page_id)
+        self.page_row_by_id(&self.connection, page_id)
     }
 
-    fn page_row_by_id(&self, page_id: i64) -> Result<PageRow> {
-        self.connection
+    fn page_row_by_id(&self, connection: &Connection, page_id: i64) -> Result<PageRow> {
+        connection
             .query_row(
                 "SELECT id, source_kind, title, revision_id, revision_url, fetched_at, url FROM pages WHERE id = ?1",
                 [page_id],
@@ -1263,8 +1239,12 @@ impl SearchEngine {
             .map_err(Into::into)
     }
 
-    fn section_rows(&self, page_id: i64) -> Result<Vec<(i64, usize, String, String)>> {
-        let mut statement = self.connection.prepare(
+    fn section_rows(
+        &self,
+        connection: &Connection,
+        page_id: i64,
+    ) -> Result<Vec<(i64, usize, String, String)>> {
+        let mut statement = connection.prepare(
             "SELECT section_index, level, heading, content FROM sections WHERE page_id = ?1 ORDER BY id",
         )?;
         Ok(statement
@@ -1307,49 +1287,87 @@ impl SearchEngine {
     }
 }
 
-pub fn verify_index(database: &Path) -> Result<()> {
+/// Verifies the Wiki index and compares every stored page to its snapshot manifest.
+pub fn verify_index(database: &Path, snapshot: &Path) -> Result<()> {
     let connection =
         Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    verify_database(&connection, "wiki")?;
+    let metadata: SnapshotMetadata = serde_json::from_str(&connection.query_row(
+        "SELECT value FROM meta WHERE key = 'snapshot'",
+        [],
+        |row| row.get::<_, String>(0),
+    )?)?;
+    let pages: Vec<PageManifest> = read_json_lines(&snapshot.join("manifest.jsonl"))?;
+    verify_page_count(&connection, "wiki", pages.len())?;
+    let expected = pages
+        .into_iter()
+        .map(|page| (page.page_id, page))
+        .collect::<HashMap<_, _>>();
+    let mut statement = connection.prepare(
+        "SELECT id, title, revision_id, content_sha256, raw_content_zstd FROM pages WHERE source_kind = 'wiki' ORDER BY id",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut verified = 0;
+    eprintln!("Wiki index verify: 0/{}", expected.len());
+    while let Some(row) = rows.next()? {
+        let page_id = row.get::<_, i64>(0)?;
+        let page = expected
+            .get(&page_id)
+            .ok_or_else(|| anyhow!("indexed Wiki page {page_id} is absent from manifest"))?;
+        let revision_id =
+            u64::try_from(row.get::<_, i64>(2)?).context("indexed revision ID is negative")?;
+        if row.get::<_, String>(1)? != page.title
+            || revision_id != page.revision_id
+            || row.get::<_, String>(3)? != page.sha256
+        {
+            bail!("indexed metadata mismatch for {}", page.title);
+        }
+        let raw = zstd::stream::decode_all(row.get_ref(4)?.as_blob()?)?;
+        if format!("{:x}", Sha256::digest(&raw)) != page.sha256 {
+            bail!("indexed raw HTML checksum mismatch for {}", page.title);
+        }
+        verified += 1;
+        if verified % 1_000 == 0 || verified == expected.len() {
+            eprintln!("Wiki index verify: {verified}/{}", expected.len());
+        }
+    }
+    if metadata.included_pages != expected.len() {
+        bail!("indexed snapshot metadata count does not match manifest");
+    }
+    Ok(())
+}
+
+/// Verifies the standalone decoded game-cache index.
+pub fn verify_cache_index(database: &Path) -> Result<()> {
+    let connection =
+        Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    verify_database(&connection, "cache")?;
+    let metadata: CacheMetadata = serde_json::from_str(&connection.query_row(
+        "SELECT value FROM meta WHERE key = 'cache'",
+        [],
+        |row| row.get::<_, String>(0),
+    )?)?;
+    verify_page_count(&connection, "cache", metadata.entries)
+}
+
+fn verify_database(connection: &Connection, source_kind: &str) -> Result<()> {
     let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     if integrity != "ok" {
         bail!("SQLite integrity check failed: {integrity}");
     }
-    let invalid: i64 = connection.query_row(
-        "SELECT count(*) FROM chunks WHERE length(embedding) != ?1",
-        [(EMBEDDING_DIMENSION * 4) as i64],
-        |row| row.get(0),
-    )?;
-    if invalid != 0 {
-        bail!("{invalid} chunk embeddings have the wrong dimension");
-    }
     let pages: i64 = connection.query_row(
-        "SELECT count(*) FROM pages WHERE source_kind = 'wiki'",
-        [],
+        "SELECT count(*) FROM pages WHERE source_kind = ?1",
+        [source_kind],
         |row| row.get(0),
     )?;
     let chunks: i64 = connection.query_row("SELECT count(*) FROM chunks", [], |row| row.get(0))?;
     if pages == 0 || chunks == 0 {
         bail!("index is empty");
     }
-    let cache_metadata = connection
-        .query_row("SELECT value FROM meta WHERE key = 'cache'", [], |row| {
-            row.get::<_, String>(0)
-        })
-        .optional()?;
-    let cache_entries: i64 =
-        connection.query_row("SELECT count(*) FROM cache_entries", [], |row| row.get(0))?;
-    match cache_metadata {
-        Some(metadata) => {
-            let metadata: CacheMetadata = serde_json::from_str(&metadata)?;
-            if cache_entries != metadata.entries as i64 {
-                bail!(
-                    "cache entry count {cache_entries} does not match metadata count {}",
-                    metadata.entries
-                );
-            }
-        }
-        None if cache_entries != 0 => bail!("cache entries exist without cache metadata"),
-        None => {}
+    let fts_chunks: i64 =
+        connection.query_row("SELECT count(*) FROM chunks_fts", [], |row| row.get(0))?;
+    if chunks != fts_chunks {
+        bail!("FTS row count {fts_chunks} does not match chunk count {chunks}");
     }
     Ok(())
 }
@@ -1390,8 +1408,7 @@ fn create_schema(connection: &Connection) -> Result<()> {
            ordinal INTEGER NOT NULL,
            title TEXT NOT NULL,
            heading TEXT NOT NULL,
-           text TEXT NOT NULL,
-           embedding BLOB NOT NULL
+           text TEXT NOT NULL
          );
          CREATE TABLE aliases(alias TEXT PRIMARY KEY COLLATE NOCASE, page_id INTEGER NOT NULL REFERENCES pages(id));
          CREATE TABLE cache_entries(
@@ -1408,7 +1425,7 @@ fn create_schema(connection: &Connection) -> Result<()> {
          CREATE INDEX cache_lookup ON cache_entries(kind, entry_id);
          CREATE INDEX chunks_page ON chunks(page_id);
          CREATE INDEX sections_page ON sections(page_id, section_index);
-         CREATE VIRTUAL TABLE chunks_fts USING fts5(title, heading, text, content='chunks', content_rowid='id', tokenize='unicode61 remove_diacritics 2');
+         CREATE VIRTUAL TABLE chunks_fts USING fts5(title, heading, text, content='chunks', content_rowid='id', tokenize='porter unicode61 remove_diacritics 2');
          CREATE TRIGGER chunks_ai AFTER INSERT ON chunks BEGIN
            INSERT INTO chunks_fts(rowid, title, heading, text) VALUES (new.id, new.title, new.heading, new.text);
          END;
@@ -1419,52 +1436,13 @@ fn create_schema(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn normalize(vector: &mut [f32]) -> Result<()> {
-    if vector.len() != EMBEDDING_DIMENSION {
-        bail!(
-            "expected {EMBEDDING_DIMENSION}-value embedding, got {}",
-            vector.len()
-        );
-    }
-    let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
-    if !norm.is_finite() || norm == 0.0 {
-        bail!("embedding has invalid norm");
-    }
-    for value in vector {
-        *value /= norm;
-    }
-    Ok(())
-}
-
-fn dot_bytes(left: &[f32], right: &[u8]) -> Result<f32> {
-    if right.len() != left.len() * 4 {
-        bail!("embedding byte length does not match query dimension");
-    }
-    let score = left
-        .iter()
-        .zip(right.chunks_exact(4))
-        .map(|(left, right)| left * f32::from_le_bytes(right.try_into().expect("four-byte chunk")))
-        .sum::<f32>();
-    if !score.is_finite() {
-        bail!("embedding produced a non-finite score");
-    }
-    Ok(score)
-}
-
-fn vector_bytes(vector: &[f32]) -> Vec<u8> {
-    vector
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect()
-}
-
 fn fts_query(query: &str) -> String {
     query
         .split(|character: char| !character.is_alphanumeric())
         .filter(|token| !token.is_empty())
         .map(|token| format!("\"{token}\"*"))
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" OR ")
 }
 
 fn cap_chars(value: &str, limit: usize) -> (String, bool) {
@@ -1493,28 +1471,13 @@ fn page_url(title: &str) -> String {
     format!("{WIKI_ORIGIN}/w/{}", title.replace(' ', "_"))
 }
 
-fn write_model_notice(cache: &Path) -> Result<()> {
-    fs::write(
-        cache.join("MODEL_NOTICE.md"),
-        "# Local embedding model\n\nThe index uses `Qdrant/bge-small-en-v1.5-onnx-Q` through FastEmbed. The model and FastEmbed are Apache-2.0 licensed. Source: https://huggingface.co/Qdrant/bge-small-en-v1.5-onnx-Q\n",
-    )?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn dot_product_reads_embedding_blob_without_allocating() {
-        let stored = vector_bytes(&[4.0, 5.0, 6.0]);
-        assert_eq!(dot_bytes(&[1.0, 2.0, 3.0], &stored).unwrap(), 32.0);
-        assert!(dot_bytes(&[1.0], &stored).is_err());
-    }
-
-    #[test]
     fn fts_input_is_quoted() {
-        assert_eq!(fts_query("bow (charged)"), "\"bow\"* \"charged\"*");
+        assert_eq!(fts_query("bow (charged)"), "\"bow\"* OR \"charged\"*");
     }
 
     #[test]
@@ -1526,8 +1489,8 @@ mod tests {
             .unwrap();
         connection
             .execute(
-                "INSERT INTO chunks(id, page_id, section_id, ordinal, title, heading, text, embedding) VALUES (1, 1, 1, 0, 'Bow', 'Stats', 'ranged strength', ?1)",
-                [vec![0_u8; EMBEDDING_DIMENSION * 4]],
+                "INSERT INTO chunks(id, page_id, section_id, ordinal, title, heading, text) VALUES (1, 1, 1, 0, 'Bow', 'Stats', 'ranged strength')",
+                [],
             )
             .unwrap();
         let count: i64 = connection
@@ -1612,13 +1575,12 @@ mod tests {
                 .unwrap();
             connection
                 .execute(
-                    "INSERT INTO chunks(id, page_id, section_id, ordinal, title, heading, text, embedding) VALUES (?1, ?2, ?3, 0, ?4, 'Data', 'abyssal whip', ?5)",
+                    "INSERT INTO chunks(id, page_id, section_id, ordinal, title, heading, text) VALUES (?1, ?2, ?3, 0, ?4, 'Data', 'abyssal whip')",
                     params![
                         if page_id == 1 { 1 } else { 2 },
                         page_id,
                         if page_id == 1 { 1 } else { 2 },
-                        title,
-                        vec![0_u8; EMBEDDING_DIMENSION * 4]
+                        title
                     ],
                 )
                 .unwrap();
@@ -1668,6 +1630,173 @@ mod tests {
             .collect::<rusqlite::Result<Vec<i64>>>()
             .unwrap();
         assert_eq!(unified.len(), 2);
+    }
+
+    #[test]
+    fn unified_search_reads_separate_wiki_and_cache_databases() {
+        let root = tempfile::tempdir().unwrap();
+        let wiki_path = root.path().join("wiki.sqlite");
+        let cache_path = root.path().join("cache.sqlite");
+        let wiki = Connection::open(&wiki_path).unwrap();
+        create_schema(&wiki).unwrap();
+        let snapshot = SnapshotMetadata {
+            snapshot_date: "2026-08-17".to_string(),
+            started_at: String::new(),
+            completed_at: String::new(),
+            wiki_origin: WIKI_ORIGIN.to_string(),
+            namespaces: vec![0, 120],
+            shard_index: None,
+            shard_count: None,
+            enumerated_pages: 1,
+            included_pages: 1,
+            excluded_pages: 0,
+            aliases: 0,
+            content_license: CONTENT_LICENSE.to_string(),
+            content_license_url: CONTENT_LICENSE_URL.to_string(),
+        };
+        wiki.execute(
+            "INSERT INTO meta(key, value) VALUES ('snapshot', ?1)",
+            [serde_json::to_string(&snapshot).unwrap()],
+        )
+        .unwrap();
+        insert_search_fixture(&wiki, 1, "wiki", "Abyssal whip");
+
+        let cache = Connection::open(&cache_path).unwrap();
+        create_schema(&cache).unwrap();
+        let cache_metadata = CacheMetadata {
+            commit: "0".repeat(40),
+            committed_at: "2026-08-17T00:00:00Z".to_string(),
+            indexed_at: "2026-08-17T00:00:00Z".to_string(),
+            source_url: CACHE_ORIGIN.to_string(),
+            entries: 1,
+        };
+        cache
+            .execute(
+                "INSERT INTO meta(key, value) VALUES ('cache', ?1)",
+                [serde_json::to_string(&cache_metadata).unwrap()],
+            )
+            .unwrap();
+        insert_search_fixture(&cache, -1, "cache", "Cache abyssal whip");
+        cache
+            .execute(
+                "INSERT INTO cache_entries(page_id, kind, entry_id, symbol, path, commit_sha) VALUES (-1, 'config/obj', '4151', 'abyssal_whip', '', '')",
+                [],
+            )
+            .unwrap();
+        drop(wiki);
+        drop(cache);
+
+        let engine = SearchEngine::open(&wiki_path, Some(&cache_path)).unwrap();
+        let output = engine.search_unified("abyssal whip", 5, 0).unwrap();
+        assert_eq!(output.results.len(), 2);
+        assert!(output.results.iter().any(|row| row.source == "wiki"));
+        assert!(output.results.iter().any(|row| row.source == "cache"));
+    }
+
+    #[test]
+    fn verification_rejects_changed_indexed_html() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("wiki.sqlite");
+        let connection = Connection::open(&database).unwrap();
+        create_schema(&connection).unwrap();
+        let raw = b"<html>pinned</html>";
+        let sha256 = format!("{:x}", Sha256::digest(raw));
+        let snapshot = SnapshotMetadata {
+            snapshot_date: "2026-08-17".to_string(),
+            started_at: String::new(),
+            completed_at: String::new(),
+            wiki_origin: WIKI_ORIGIN.to_string(),
+            namespaces: vec![0],
+            shard_index: None,
+            shard_count: None,
+            enumerated_pages: 1,
+            included_pages: 1,
+            excluded_pages: 0,
+            aliases: 0,
+            content_license: CONTENT_LICENSE.to_string(),
+            content_license_url: CONTENT_LICENSE_URL.to_string(),
+        };
+        connection
+            .execute(
+                "INSERT INTO meta(key, value) VALUES ('snapshot', ?1)",
+                [serde_json::to_string(&snapshot).unwrap()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO pages(id, source_kind, namespace, title, revision_id, revision_url, modified_at, touched_at, fetched_at, url, categories_json, content_sha256, raw_content_zstd) VALUES (1, 'wiki', 0, 'Pinned', 7, '', '', NULL, '', '', '[]', ?1, ?2)",
+                params![sha256, zstd::stream::encode_all(raw.as_slice(), 1).unwrap()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sections(page_id, section_index, level, heading, content) VALUES (1, 0, 1, 'Lead', 'pinned')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO chunks(page_id, section_id, ordinal, title, heading, text) VALUES (1, 1, 0, 'Pinned', 'Lead', 'pinned')",
+                [],
+            )
+            .unwrap();
+        let manifest = PageManifest {
+            title: "Pinned".to_string(),
+            namespace: 0,
+            page_id: 1,
+            revision_id: 7,
+            revision_url: String::new(),
+            modified_at: String::new(),
+            touched_at: None,
+            fetched_at: String::new(),
+            categories: Vec::new(),
+            path: "pages/0/1.html".to_string(),
+            sha256,
+        };
+        fs::write(
+            root.path().join("manifest.jsonl"),
+            format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+        )
+        .unwrap();
+        drop(connection);
+
+        verify_index(&database, root.path()).unwrap();
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE pages SET raw_content_zstd = ?1 WHERE id = 1",
+                [zstd::stream::encode_all(b"changed".as_slice(), 1).unwrap()],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(verify_index(&database, root.path()).is_err());
+    }
+
+    fn insert_search_fixture(
+        connection: &Connection,
+        page_id: i64,
+        source_kind: &str,
+        title: &str,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO pages(id, source_kind, namespace, title, revision_id, revision_url, modified_at, touched_at, fetched_at, url, categories_json, content_sha256, raw_content_zstd) VALUES (?1, ?2, 0, ?3, 0, '', '', NULL, '', '', '[]', '', X'')",
+                params![page_id, source_kind, title],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sections(page_id, section_index, level, heading, content) VALUES (?1, 0, 1, 'Data', 'abyssal whip')",
+                [page_id],
+            )
+            .unwrap();
+        let section_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO chunks(page_id, section_id, ordinal, title, heading, text) VALUES (?1, ?2, 0, ?3, 'Data', 'abyssal whip')",
+                params![page_id, section_id, title],
+            )
+            .unwrap();
     }
 
     #[test]

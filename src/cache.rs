@@ -49,8 +49,8 @@ pub(crate) fn read_cache_dump(root: &Path, expected_commit: &str) -> Result<Cach
     if commit != expected_commit {
         bail!("cache dump is at commit {commit}, expected {expected_commit}");
     }
-    if !git(root, &["status", "--porcelain", "--untracked-files=no"])?.is_empty() {
-        bail!("cache dump has modified tracked files");
+    if !git(root, &["status", "--porcelain"])?.is_empty() {
+        bail!("cache dump has working tree changes");
     }
 
     let mut documents = read_documents(root)?;
