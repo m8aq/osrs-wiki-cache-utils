@@ -190,7 +190,7 @@ impl ServerHandler for OfflineWiki {
                     .with_title("Offline OSRS Wiki and Cache"),
             )
             .with_instructions(
-                "Use search_unified when either source may answer the query. For implementation questions, use search_wiki for gameplay context, then make focused search_cache calls with a kind such as config/loc or config/varbit. Use get_cache_entry for the complete revision-pinned record. Cache data is raw client data, not player state or a gameplay explanation.",
+                "Search is lexical: translate natural-language requests into short, focused queries and try multiple vocabulary variants when needed. Use search_unified when either source may answer the query. For implementation questions, use search_wiki for gameplay context, then make focused search_cache calls with a kind such as config/loc or config/varbit. Use get_cache_entry for the complete revision-pinned record. Cache data is raw client data, not player state or a gameplay explanation.",
             )
     }
 }

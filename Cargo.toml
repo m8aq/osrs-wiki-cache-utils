@@ -3,7 +3,7 @@ name = "osrs-wiki-offline"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Build and search an offline Parsoid snapshot of the OSRS Wiki"
+description = "Build and search offline OSRS Wiki and decoded game-cache indexes"
 
 [dependencies]
 anyhow = "1"

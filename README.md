@@ -7,6 +7,7 @@ Unlike searching downloaded files with `rg`, this tool understands Wiki page
 sections, nested tables, tabs, titles, and redirects. It packs that structure
 into searchable chunks and ranks matching pages with SQLite FTS5/BM25. Exact
 Wiki titles, redirect aliases, cache symbols, and cache IDs are boosted.
+No embedding model, vector database, or database server is required.
 
 Everything runs offline after the data is built. MCP tools return bounded
 evidence with canonical URLs and revision provenance for a calling agent to
@@ -72,6 +73,20 @@ target/release/osrs-wiki-offline cache-get \
   --cache-database cache.sqlite \
   config/obj 4151
 ```
+
+Search is lexical, so use exact titles or short groups of distinctive terms.
+For example, turn "What equipment makes Blast Furnace runs efficient?" into a
+few focused searches:
+
+```text
+Blast Furnace
+Blast Furnace coal bag ice gloves
+Blast Furnace stamina bar dispenser
+```
+
+Run multiple searches when useful and combine their evidence. For cache data,
+prefer exact IDs, symbols, names, and a `--kind` filter. Generic words such as
+"how", "which", and "minigame" usually add little.
 
 ## MCP
 
