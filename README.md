@@ -54,7 +54,7 @@ curl -fLO "$BASE/cache.sqlite"
 ```
 
 No Rust toolchain, database server, snapshot, embedding model, or indexing is
-needed. Checksums are available as `SHA256SUMS` in the release.
+needed. Checksums are available as `SHA256SUMS-v0.1.0.txt` in the release.
 
 ## Build From Source
 
