@@ -19,7 +19,7 @@ Prebuilt binaries are available for Apple Silicon macOS, x86-64 Linux, and
 64-bit Windows. On macOS or Linux, download the binary and Wiki database:
 
 ```sh
-mkdir osrs-search && cd osrs-search
+mkdir -p "$HOME/Documents/osrs" && cd "$HOME/Documents/osrs"
 BASE=https://github.com/m8aq/osrs-wiki-cache-utils/releases/latest/download
 # Linux: replace aarch64-apple-darwin with x86_64-unknown-linux-musl
 curl -fL "$BASE/osrs-wiki-cache-utils-aarch64-apple-darwin" -o osrs-wiki-cache-utils
@@ -34,7 +34,8 @@ chmod +x osrs-wiki-cache-utils
 On Windows PowerShell:
 
 ```powershell
-mkdir osrs-search; cd osrs-search
+New-Item -ItemType Directory -Force "$HOME\Documents\osrs" | Out-Null
+Set-Location "$HOME\Documents\osrs"
 $base = "https://github.com/m8aq/osrs-wiki-cache-utils/releases/latest/download"
 Invoke-WebRequest "$base/osrs-wiki-cache-utils-x86_64-pc-windows-msvc.exe" -OutFile osrs-wiki-cache-utils.exe
 Invoke-WebRequest "$base/wiki.sqlite" -OutFile wiki.sqlite
