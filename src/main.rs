@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 use index::{SearchEngine, build_cache_index, build_index, verify_cache_index, verify_index};
 use mcp::OfflineWiki;
 use rmcp::{ServiceExt, transport::stdio};
-use snapshot::{SnapshotOptions, build_snapshot, verify_snapshot};
+use snapshot::{build_snapshot, verify_snapshot};
 
 pub(crate) const WIKI_ORIGIN: &str = "https://oldschool.runescape.wiki";
 pub(crate) const CONTENT_LICENSE: &str = "CC BY-NC-SA 3.0";
@@ -102,13 +102,8 @@ async fn main() -> Result<()> {
             concurrency,
             titles,
         } => {
-            let metadata = build_snapshot(SnapshotOptions {
-                output,
-                requests_per_second,
-                concurrency,
-                titles,
-            })
-            .await?;
+            let metadata =
+                build_snapshot(&output, requests_per_second, concurrency, &titles).await?;
             eprintln!(
                 "snapshot complete: {} included, {} excluded",
                 metadata.included_pages, metadata.excluded_pages

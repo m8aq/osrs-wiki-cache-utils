@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{BufRead, BufReader},
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
     time::Duration,
 };
@@ -25,14 +25,6 @@ use crate::{
 const API_URL: &str = "https://oldschool.runescape.wiki/api.php";
 const USER_AGENT: &str = "osrs-wiki-offline/0.1 (+https://github.com/Kiyogitpy/osrs-wiki-data)";
 const NAMESPACES: [i64; 2] = [0, 120];
-
-#[derive(Debug, Clone)]
-pub struct SnapshotOptions {
-    pub output: PathBuf,
-    pub requests_per_second: f64,
-    pub concurrency: usize,
-    pub titles: Vec<String>,
-}
 
 #[derive(Debug, Clone)]
 struct EnumeratedPage {
@@ -144,33 +136,38 @@ impl WikiHttp {
     }
 }
 
-pub async fn build_snapshot(options: SnapshotOptions) -> Result<SnapshotMetadata> {
-    if options.concurrency == 0 {
+pub async fn build_snapshot(
+    output: &Path,
+    requests_per_second: f64,
+    concurrency: usize,
+    titles: &[String],
+) -> Result<SnapshotMetadata> {
+    if concurrency == 0 {
         bail!("concurrency must be greater than zero");
     }
-    fs::create_dir_all(options.output.join("pages/0"))?;
-    fs::create_dir_all(options.output.join("pages/120"))?;
+    fs::create_dir_all(output.join("pages/0"))?;
+    fs::create_dir_all(output.join("pages/120"))?;
     let started_at = Utc::now().to_rfc3339();
     let previous_included: BTreeMap<i64, PageManifest> =
-        read_json_lines_if_exists::<PageManifest>(&options.output.join("manifest.jsonl"))?
+        read_json_lines_if_exists::<PageManifest>(&output.join("manifest.jsonl"))?
             .into_iter()
             .map(|page| (page.page_id, page))
             .collect();
     let previous_excluded: BTreeMap<i64, ExcludedManifest> =
-        read_json_lines_if_exists::<ExcludedManifest>(&options.output.join("excluded.jsonl"))?
+        read_json_lines_if_exists::<ExcludedManifest>(&output.join("excluded.jsonl"))?
             .into_iter()
             .map(|page| (page.page_id, page))
             .collect();
-    let http = WikiHttp::new(options.requests_per_second)?;
-    let mut pages = if options.titles.is_empty() {
+    let http = WikiHttp::new(requests_per_second)?;
+    let mut pages = if titles.is_empty() {
         enumerate_pages(&http).await?
     } else {
-        resolve_titles(&http, &options.titles).await?
+        resolve_titles(&http, titles).await?
     };
     pages.sort_by(|left, right| left.title.cmp(&right.title));
     let aliases = enumerate_aliases(&http, &pages).await?;
 
-    let output = options.output.clone();
+    let output = output.to_path_buf();
     let mut fetches = stream::iter(pages.iter().cloned().map(|page| {
         let http = http.clone();
         let output = output.clone();
@@ -183,7 +180,7 @@ pub async fn build_snapshot(options: SnapshotOptions) -> Result<SnapshotMetadata
                 .with_context(|| format!("fetch {title}"))
         }
     }))
-    .buffer_unordered(options.concurrency);
+    .buffer_unordered(concurrency);
 
     let mut included = Vec::new();
     let mut excluded = Vec::new();
@@ -203,16 +200,16 @@ pub async fn build_snapshot(options: SnapshotOptions) -> Result<SnapshotMetadata
     included.sort_by(|left, right| left.title.cmp(&right.title));
     excluded.sort_by(|left, right| left.title.cmp(&right.title));
 
-    write_snapshot_progress(&options.output, &included, &excluded, &aliases, &failures)?;
+    write_snapshot_progress(&output, &included, &excluded, &aliases, &failures)?;
 
-    if options.titles.is_empty() {
+    if titles.is_empty() {
         let current = included
             .iter()
             .map(|page| page.page_id)
             .collect::<BTreeSet<_>>();
         for page in previous_included.values() {
             if !current.contains(&page.page_id) {
-                let _ = fs::remove_file(options.output.join(&page.path));
+                let _ = fs::remove_file(output.join(&page.path));
             }
         }
     }
@@ -230,8 +227,11 @@ pub async fn build_snapshot(options: SnapshotOptions) -> Result<SnapshotMetadata
         content_license: CONTENT_LICENSE.to_string(),
         content_license_url: CONTENT_LICENSE_URL.to_string(),
     };
-    write_json(&options.output.join("snapshot.json"), &metadata)?;
-    write_attribution(&options.output)?;
+    write_atomic(
+        &output.join("snapshot.json"),
+        &serde_json::to_vec_pretty(&metadata)?,
+    )?;
+    write_attribution(&output)?;
     Ok(metadata)
 }
 
@@ -249,7 +249,7 @@ fn write_snapshot_progress(
         let _ = fs::remove_file(output.join("failures.txt"));
         return Ok(());
     }
-    write_lines(&output.join("failures.txt"), failures)?;
+    write_atomic(&output.join("failures.txt"), failures.join("\n").as_bytes())?;
     bail!(
         "snapshot incomplete: {} page(s) failed; rerun to resume",
         failures.len()
@@ -562,14 +562,6 @@ fn write_json_lines<T: Serialize>(path: &Path, values: &[T]) -> Result<()> {
         output.push(b'\n');
     }
     write_atomic(path, &output)
-}
-
-fn write_lines(path: &Path, values: &[String]) -> Result<()> {
-    write_atomic(path, values.join("\n").as_bytes())
-}
-
-fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    write_atomic(path, &serde_json::to_vec_pretty(value)?)
 }
 
 fn write_attribution(root: &Path) -> Result<()> {

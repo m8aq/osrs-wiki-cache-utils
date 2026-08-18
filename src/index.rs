@@ -26,7 +26,8 @@ const SECTION_CAP: usize = 200;
 const CANDIDATE_LIMIT: usize = 50;
 const CACHE_BATCH_SIZE: usize = 1_000;
 const SQLITE_CACHE_KIB: i64 = 32 * 1024;
-const LEXICAL_SQL: &str = "SELECT chunks_fts.rowid FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid JOIN pages p ON p.id = c.page_id LEFT JOIN cache_entries ce ON ce.page_id = p.id WHERE chunks_fts MATCH ?1 AND (?2 IS NULL OR p.source_kind = ?2) AND (?3 IS NULL OR ce.kind = ?3 COLLATE NOCASE) ORDER BY bm25(chunks_fts, 10.0, 4.0, 1.0) LIMIT ?4";
+const SCHEMA_VERSION: i64 = 1;
+const LEXICAL_SQL: &str = "SELECT chunks_fts.rowid FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid LEFT JOIN cache_entries ce ON ce.page_id = c.page_id WHERE chunks_fts MATCH ?1 AND (?2 IS NULL OR ce.kind = ?2 COLLATE NOCASE) ORDER BY bm25(chunks_fts, 10.0, 4.0, 1.0) LIMIT ?3";
 const RECOVERY_WARNING: &str =
     "Derived retrieval text; lossless Parsoid HTML is retained in the Wiki database.";
 
@@ -171,7 +172,7 @@ pub fn build_index(snapshot: &Path, database: &Path) -> Result<()> {
     let metadata = verify_snapshot(snapshot)?;
     let pages: Vec<PageManifest> = read_json_lines(&snapshot.join("manifest.jsonl"))?;
     let aliases: Vec<AliasManifest> = read_json_lines(&snapshot.join("aliases.jsonl"))?;
-    if database.exists() && current_schema(database)? {
+    if database.exists() && current_schema(database, "wiki")? {
         update_index(snapshot, database, &metadata, &pages, &aliases)
     } else {
         build_new_index(snapshot, database, &metadata, &pages, &aliases)
@@ -194,7 +195,7 @@ fn build_new_index(
     }
     let temporary = database.with_extension("sqlite.part");
     let mut connection = Connection::open(&temporary)?;
-    if current_schema(&temporary)? {
+    if current_schema(&temporary, "wiki")? {
         let stored: String =
             connection.query_row("SELECT value FROM meta WHERE key = 'snapshot'", [], |row| {
                 row.get(0)
@@ -215,7 +216,7 @@ fn build_new_index(
             [serde_json::to_string(metadata)?],
         )?;
     }
-    let existing = indexed_page_ids(&connection, "wiki")?;
+    let existing = indexed_page_ids(&connection)?;
     eprintln!("wiki index: {}/{}", existing.len(), pages.len());
     for (index, page) in pages.iter().enumerate() {
         if !existing.contains(&page.page_id) {
@@ -253,7 +254,7 @@ fn update_index(
     let mut connection = Connection::open(database)?;
     let existing = {
         let mut statement = connection
-            .prepare("SELECT id, revision_id, touched_at, content_sha256, title FROM pages WHERE source_kind = 'wiki'")?;
+            .prepare("SELECT id, revision_id, touched_at, content_sha256, title FROM pages")?;
         statement
             .query_map([], |row| {
                 Ok((
@@ -328,7 +329,7 @@ fn update_index(
 /// Builds or incrementally updates the standalone decoded game-cache index.
 pub fn build_cache_index(database: &Path, cache_dump: &Path, cache_commit: &str) -> Result<()> {
     let cache = read_cache_dump(cache_dump, cache_commit)?;
-    if database.exists() && current_schema(database)? {
+    if database.exists() && current_schema(database, "cache")? {
         let mut connection = Connection::open(database)?;
         let transaction = connection.transaction()?;
         let counts = update_cache(&transaction, &cache)?;
@@ -354,7 +355,7 @@ pub fn build_cache_index(database: &Path, cache_dump: &Path, cache_commit: &str)
     require_free_space(database, required)?;
     let temporary = database.with_extension("sqlite.part");
     let mut connection = Connection::open(&temporary)?;
-    if current_schema(&temporary)? {
+    if current_schema(&temporary, "cache")? {
         let stored: CacheMetadata = serde_json::from_str(&connection.query_row(
             "SELECT value FROM meta WHERE key = 'cache'",
             [],
@@ -418,7 +419,7 @@ fn insert_page(transaction: &Transaction<'_>, snapshot: &Path, page: &PageManife
             page.modified_at,
             page.touched_at,
             page.fetched_at,
-            page_url(&page.title),
+            format!("{WIKI_ORIGIN}/w/{}", page.title.replace(' ', "_")),
             serde_json::to_string(&page.categories)?,
             page.sha256,
             raw_content,
@@ -644,44 +645,48 @@ fn insert_aliases(transaction: &Transaction<'_>, aliases: &[AliasManifest]) -> R
     Ok(())
 }
 
-fn current_schema(database: &Path) -> Result<bool> {
+fn current_schema(database: &Path, source_kind: &str) -> Result<bool> {
     let connection = Connection::open(database)?;
-    let required: i64 = connection.query_row(
-        "SELECT count(*) FROM pragma_table_info('pages') WHERE name IN ('touched_at', 'source_kind', 'content_sha256', 'raw_content_zstd')",
-        [],
-        |row| row.get(0),
-    )?;
-    let redundant: i64 = connection.query_row(
-        "SELECT (SELECT count(*) FROM pragma_table_info('pages') WHERE name = 'wiki_page_id') + (SELECT count(*) FROM pragma_table_info('sections') WHERE name = 'parsoid_section_id')",
-        [],
-        |row| row.get(0),
-    )?;
-    let cache_entries: i64 = connection.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'cache_entries'",
-        [],
-        |row| row.get(0),
-    )?;
-    let unique_page_indexes: i64 = connection.query_row(
-        "SELECT count(*) FROM pragma_index_list('pages') WHERE [unique] = 1",
-        [],
-        |row| row.get(0),
-    )?;
-    let embedding_columns: i64 = connection.query_row(
-        "SELECT count(*) FROM pragma_table_info('chunks') WHERE name = 'embedding'",
-        [],
-        |row| row.get(0),
-    )?;
-    Ok(required == 4
-        && redundant == 0
-        && cache_entries == 1
-        && unique_page_indexes == 0
-        && embedding_columns == 0)
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version != 0 && version != SCHEMA_VERSION {
+        return Ok(false);
+    }
+    let compatible = version == SCHEMA_VERSION
+        || connection.query_row(
+            "SELECT
+           (SELECT count(*) FROM pragma_table_info('pages') WHERE name IN ('touched_at', 'source_kind', 'content_sha256', 'raw_content_zstd')) = 4
+           AND (SELECT count(*) FROM pragma_table_info('pages') WHERE name = 'wiki_page_id') = 0
+           AND (SELECT count(*) FROM pragma_table_info('sections') WHERE name = 'parsoid_section_id') = 0
+           AND (SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'cache_entries') = 1
+           AND (SELECT count(*) FROM pragma_index_list('pages') WHERE [unique] = 1) = 0
+           AND (SELECT count(*) FROM pragma_table_info('chunks') WHERE name = 'embedding') = 0",
+            [],
+            |row| row.get(0),
+        )?;
+    if !compatible {
+        return Ok(false);
+    }
+    let other: Option<String> = connection
+        .query_row(
+            "SELECT source_kind FROM pages WHERE source_kind <> ?1 LIMIT 1",
+            [source_kind],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(other) = other {
+        bail!("database contains {other} data; expected {source_kind}");
+    }
+    if version == 0 {
+        connection.execute("DROP INDEX IF EXISTS pages_source", [])?;
+        connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    }
+    Ok(true)
 }
 
-fn indexed_page_ids(connection: &Connection, source_kind: &str) -> Result<HashSet<i64>> {
-    let mut statement = connection.prepare("SELECT id FROM pages WHERE source_kind = ?1")?;
+fn indexed_page_ids(connection: &Connection) -> Result<HashSet<i64>> {
+    let mut statement = connection.prepare("SELECT id FROM pages")?;
     Ok(statement
-        .query_map([source_kind], |row| row.get(0))?
+        .query_map([], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?)
 }
 
@@ -693,11 +698,7 @@ fn indexed_cache_keys(connection: &Connection) -> Result<HashSet<(String, String
 }
 
 fn verify_page_count(connection: &Connection, source_kind: &str, expected: usize) -> Result<()> {
-    let indexed: i64 = connection.query_row(
-        "SELECT count(*) FROM pages WHERE source_kind = ?1",
-        [source_kind],
-        |row| row.get(0),
-    )?;
+    let indexed: i64 = connection.query_row("SELECT count(*) FROM pages", [], |row| row.get(0))?;
     if indexed != expected as i64 {
         bail!("{source_kind} page count {indexed} does not match expected count {expected}");
     }
@@ -792,7 +793,7 @@ impl SearchEngine {
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Result<SearchOutput> {
-        self.search_source(query, limit, "wiki", None)
+        self.search_source(&self.connection, query, limit, "wiki", None)
     }
 
     /// Searches decoded, revision-pinned game-cache records, optionally by kind.
@@ -802,14 +803,15 @@ impl SearchEngine {
         limit: usize,
         kind: Option<&str>,
     ) -> Result<SearchOutput> {
-        if self.cache.is_none() {
-            bail!("cache data is not configured");
-        }
+        let connection = self
+            .cache_connection
+            .as_ref()
+            .ok_or_else(|| anyhow!("cache data is not configured"))?;
         let kind = kind.map(str::trim);
         if kind == Some("") {
             bail!("cache kind must be non-empty");
         }
-        self.search_source(query, limit, "cache", kind)
+        self.search_source(connection, query, limit, "cache", kind)
     }
 
     /// Searches all indexed Wiki and game-cache content in one ranking.
@@ -870,19 +872,13 @@ impl SearchEngine {
 
     fn search_source(
         &self,
+        connection: &Connection,
         query: &str,
         limit: usize,
         source_kind: &str,
         cache_kind: Option<&str>,
     ) -> Result<SearchOutput> {
         validate_search(query, limit)?;
-        let connection = if source_kind == "wiki" {
-            &self.connection
-        } else {
-            self.cache_connection
-                .as_ref()
-                .ok_or_else(|| anyhow!("cache data is not configured"))?
-        };
         let rows = self.rank_rows(connection, query, source_kind, cache_kind)?;
         let total = rows.len();
         let results = rows.into_iter().take(limit).collect::<Vec<_>>();
@@ -908,7 +904,7 @@ impl SearchEngine {
         cache_kind: Option<&str>,
     ) -> Result<Vec<SearchResultRow>> {
         let query = query.trim();
-        let lexical = self.lexical_candidates(connection, query, source_kind, cache_kind)?;
+        let lexical = self.lexical_candidates(connection, query, cache_kind)?;
         let exact_chunk = self
             .resolve_page_id(connection, query, source_kind, cache_kind)?
             .map(|page_id| {
@@ -1105,7 +1101,6 @@ impl SearchEngine {
         &self,
         connection: &Connection,
         query: &str,
-        source_kind: &str,
         cache_kind: Option<&str>,
     ) -> Result<Vec<i64>> {
         let query = fts_query(query);
@@ -1114,10 +1109,9 @@ impl SearchEngine {
         }
         let mut statement = connection.prepare(LEXICAL_SQL)?;
         Ok(statement
-            .query_map(
-                params![query, source_kind, cache_kind, CANDIDATE_LIMIT as i64],
-                |row| row.get(0),
-            )?
+            .query_map(params![query, cache_kind, CANDIDATE_LIMIT as i64], |row| {
+                row.get(0)
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -1129,9 +1123,9 @@ impl SearchEngine {
         cache_kind: Option<&str>,
     ) -> Result<Option<i64>> {
         let sql = if source_kind == "wiki" {
-            "SELECT id FROM (SELECT id, CASE WHEN title = ?1 THEN 0 ELSE 1 END AS priority FROM pages WHERE source_kind = 'wiki' AND title = ?1 COLLATE NOCASE UNION ALL SELECT a.page_id, 2 FROM aliases a JOIN pages p ON p.id = a.page_id WHERE p.source_kind = 'wiki' AND a.alias = ?1 COLLATE NOCASE) ORDER BY priority LIMIT 1"
+            "SELECT id FROM (SELECT id, CASE WHEN title = ?1 THEN 0 ELSE 1 END AS priority FROM pages WHERE title = ?1 COLLATE NOCASE UNION ALL SELECT page_id, 2 FROM aliases WHERE alias = ?1 COLLATE NOCASE) ORDER BY priority LIMIT 1"
         } else {
-            "SELECT p.id FROM pages p JOIN cache_entries ce ON ce.page_id = p.id WHERE p.source_kind = 'cache' AND (p.title = ?1 COLLATE NOCASE OR ce.symbol = ?1 COLLATE NOCASE OR ce.entry_id = ?1 COLLATE NOCASE) AND (?2 IS NULL OR ce.kind = ?2 COLLATE NOCASE) LIMIT 1"
+            "SELECT p.id FROM pages p JOIN cache_entries ce ON ce.page_id = p.id WHERE (p.title = ?1 COLLATE NOCASE OR ce.symbol = ?1 COLLATE NOCASE OR ce.entry_id = ?1 COLLATE NOCASE) AND (?2 IS NULL OR ce.kind = ?2 COLLATE NOCASE) LIMIT 1"
         };
         if source_kind == "wiki" {
             connection
@@ -1231,7 +1225,7 @@ impl SearchEngine {
 pub fn verify_index(database: &Path, snapshot: &Path) -> Result<()> {
     let connection =
         Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    verify_database(&connection, "wiki")?;
+    verify_database(&connection)?;
     let metadata: SnapshotMetadata = serde_json::from_str(&connection.query_row(
         "SELECT value FROM meta WHERE key = 'snapshot'",
         [],
@@ -1244,7 +1238,7 @@ pub fn verify_index(database: &Path, snapshot: &Path) -> Result<()> {
         .map(|page| (page.page_id, page))
         .collect::<HashMap<_, _>>();
     let mut statement = connection.prepare(
-        "SELECT id, title, revision_id, content_sha256, raw_content_zstd FROM pages WHERE source_kind = 'wiki' ORDER BY id",
+        "SELECT id, title, revision_id, content_sha256, raw_content_zstd FROM pages ORDER BY id",
     )?;
     let mut rows = statement.query([])?;
     let mut verified = 0;
@@ -1281,7 +1275,7 @@ pub fn verify_index(database: &Path, snapshot: &Path) -> Result<()> {
 pub fn verify_cache_index(database: &Path) -> Result<()> {
     let connection =
         Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    verify_database(&connection, "cache")?;
+    verify_database(&connection)?;
     let metadata: CacheMetadata = serde_json::from_str(&connection.query_row(
         "SELECT value FROM meta WHERE key = 'cache'",
         [],
@@ -1290,16 +1284,12 @@ pub fn verify_cache_index(database: &Path) -> Result<()> {
     verify_page_count(&connection, "cache", metadata.entries)
 }
 
-fn verify_database(connection: &Connection, source_kind: &str) -> Result<()> {
+fn verify_database(connection: &Connection) -> Result<()> {
     let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     if integrity != "ok" {
         bail!("SQLite integrity check failed: {integrity}");
     }
-    let pages: i64 = connection.query_row(
-        "SELECT count(*) FROM pages WHERE source_kind = ?1",
-        [source_kind],
-        |row| row.get(0),
-    )?;
+    let pages: i64 = connection.query_row("SELECT count(*) FROM pages", [], |row| row.get(0))?;
     let chunks: i64 = connection.query_row("SELECT count(*) FROM chunks", [], |row| row.get(0))?;
     if pages == 0 || chunks == 0 {
         bail!("index is empty");
@@ -1360,7 +1350,6 @@ fn create_schema(connection: &Connection) -> Result<()> {
            commit_sha TEXT NOT NULL,
            UNIQUE(kind, entry_id)
          );
-         CREATE INDEX pages_source ON pages(source_kind);
          CREATE INDEX pages_title ON pages(title COLLATE NOCASE);
          CREATE INDEX cache_lookup ON cache_entries(kind, entry_id);
          CREATE INDEX chunks_page ON chunks(page_id);
@@ -1373,6 +1362,7 @@ fn create_schema(connection: &Connection) -> Result<()> {
            INSERT INTO chunks_fts(chunks_fts, rowid, title, heading, text) VALUES ('delete', old.id, old.title, old.heading, old.text);
          END;",
     )?;
+    connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
 
@@ -1405,10 +1395,6 @@ fn source(page: &PageRow) -> SourceRef {
         revision_url: page.revision_url.clone(),
         fetched_at: page.fetched_at.clone(),
     }
-}
-
-fn page_url(title: &str) -> String {
-    format!("{WIKI_ORIGIN}/w/{}", title.replace(' ', "_"))
 }
 
 #[cfg(test)]
@@ -1495,81 +1481,68 @@ mod tests {
     }
 
     #[test]
-    fn lexical_search_filters_wiki_and_cache_chunks() {
+    fn lexical_search_filters_cache_kind() {
         let connection = Connection::open_in_memory().unwrap();
         create_schema(&connection).unwrap();
-        for (page_id, source_kind, title) in
-            [(1_i64, "wiki", "Abyssal whip"), (-1, "cache", "Cache whip")]
-        {
-            connection
-                .execute(
-                    "INSERT INTO pages(id, source_kind, namespace, title, revision_id, revision_url, modified_at, touched_at, fetched_at, url, categories_json, content_sha256, raw_content_zstd) VALUES (?1, ?2, 0, ?3, 0, '', '', NULL, '', '', '[]', '', X'')",
-                    params![page_id, source_kind, title],
-                )
-                .unwrap();
-            connection
-                .execute(
-                    "INSERT INTO sections(id, page_id, section_index, level, heading, content) VALUES (?1, ?2, 0, 1, 'Data', 'abyssal whip')",
-                    params![if page_id == 1 { 1 } else { 2 }, page_id],
-                )
-                .unwrap();
-            connection
-                .execute(
-                    "INSERT INTO chunks(id, page_id, section_id, ordinal, title, heading, text) VALUES (?1, ?2, ?3, 0, ?4, 'Data', 'abyssal whip')",
-                    params![
-                        if page_id == 1 { 1 } else { 2 },
-                        page_id,
-                        if page_id == 1 { 1 } else { 2 },
-                        title
-                    ],
-                )
-                .unwrap();
-        }
+        insert_search_fixture(&connection, -1, "cache", "Cache whip");
+        insert_search_fixture(&connection, -2, "cache", "Other cache whip");
         connection
             .execute(
                 "INSERT INTO cache_entries(page_id, kind, entry_id, symbol, path, commit_sha) VALUES (-1, 'config/obj', '4151', 'abyssal_whip', '', '')",
                 [],
             )
             .unwrap();
-
-        let cache_chunk: i64 = connection
-            .query_row(
-                LEXICAL_SQL,
-                params!["whip", "cache", Option::<String>::None, 50],
-                |row| row.get(0),
+        connection
+            .execute(
+                "INSERT INTO cache_entries(page_id, kind, entry_id, symbol, path, commit_sha) VALUES (-2, 'config/loc', '1', 'whip_scenery', '', '')",
+                [],
             )
             .unwrap();
-        assert_eq!(cache_chunk, 2);
 
         let filtered: i64 = connection
-            .query_row(
-                LEXICAL_SQL,
-                params!["whip", "cache", "CONFIG/OBJ", 50],
-                |row| row.get(0),
-            )
+            .query_row(LEXICAL_SQL, params!["whip", "CONFIG/OBJ", 50], |row| {
+                row.get(0)
+            })
             .unwrap();
-        assert_eq!(filtered, 2);
+        assert_eq!(filtered, 1);
 
         let missing: Option<i64> = connection
-            .query_row(
-                LEXICAL_SQL,
-                params!["whip", "cache", "config/loc", 50],
-                |row| row.get(0),
-            )
+            .query_row(LEXICAL_SQL, params!["whip", "config/npc", 50], |row| {
+                row.get(0)
+            })
             .optional()
             .unwrap();
         assert_eq!(missing, None);
 
         let mut statement = connection.prepare(LEXICAL_SQL).unwrap();
-        let unified = statement
-            .query_map(
-                params!["whip", Option::<String>::None, Option::<String>::None, 50],
-                |row| row.get(0),
-            )
+        let unfiltered = statement
+            .query_map(params!["whip", Option::<String>::None, 50], |row| {
+                row.get(0)
+            })
             .unwrap()
             .collect::<rusqlite::Result<Vec<i64>>>()
             .unwrap();
-        assert_eq!(unified.len(), 2);
+        assert_eq!(unfiltered.len(), 2);
+    }
+
+    #[test]
+    fn adopts_current_unversioned_schema() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("index.sqlite");
+        let connection = Connection::open(&database).unwrap();
+        create_schema(&connection).unwrap();
+        connection.pragma_update(None, "user_version", 0).unwrap();
+        drop(connection);
+
+        assert!(current_schema(&database, "wiki").unwrap());
+        let connection = Connection::open(&database).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        insert_search_fixture(&connection, -1, "cache", "Cache entry");
+        drop(connection);
+        assert!(current_schema(&database, "wiki").is_err());
     }
 
     #[test]
