@@ -1,0 +1,52 @@
+name: Build release binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: rustup target add x86_64-unknown-linux-musl
+      - run: cargo test --release --locked
+      - run: cargo build --release --locked --target x86_64-unknown-linux-musl
+      - run: |
+          cp target/x86_64-unknown-linux-musl/release/osrs-wiki-cache-utils osrs-wiki-cache-utils-x86_64-unknown-linux-musl
+          ./osrs-wiki-cache-utils-x86_64-unknown-linux-musl --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: osrs-wiki-cache-utils-x86_64-unknown-linux-musl
+          if-no-files-found: error
+          retention-days: 1
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - run: cargo test --release --locked
+      - run: cargo build --release --locked
+      - shell: pwsh
+        run: |
+          Copy-Item target/release/osrs-wiki-cache-utils.exe osrs-wiki-cache-utils-x86_64-pc-windows-msvc.exe
+          .\osrs-wiki-cache-utils-x86_64-pc-windows-msvc.exe --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: osrs-wiki-cache-utils-x86_64-pc-windows-msvc.exe
+          if-no-files-found: error
+          retention-days: 1

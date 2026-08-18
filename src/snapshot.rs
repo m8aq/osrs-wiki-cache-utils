@@ -23,7 +23,8 @@ use crate::{
 };
 
 const API_URL: &str = "https://oldschool.runescape.wiki/api.php";
-const USER_AGENT: &str = "osrs-wiki-offline/0.1 (+https://github.com/Kiyogitpy/osrs-wiki-data)";
+const USER_AGENT: &str =
+    "osrs-wiki-cache-utils/0.1 (+https://github.com/m8aq/osrs-wiki-cache-utils)";
 const NAMESPACES: [i64; 2] = [0, 120];
 
 #[derive(Debug, Clone)]

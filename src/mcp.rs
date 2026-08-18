@@ -171,7 +171,7 @@ impl ServerHandler for OfflineWiki {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(
-                Implementation::new("osrs-wiki-offline", env!("CARGO_PKG_VERSION"))
+                Implementation::new("osrs-wiki-cache-utils", env!("CARGO_PKG_VERSION"))
                     .with_title("Offline OSRS Wiki and Cache"),
             )
             .with_instructions(

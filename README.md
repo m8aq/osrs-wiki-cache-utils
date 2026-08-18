@@ -15,19 +15,30 @@ interpret. The server does not generate answers.
 
 ## Quick Start
 
-The prebuilt release currently supports Apple Silicon macOS. Download the
-binary and ready-to-search Wiki database:
+Prebuilt binaries are available for Apple Silicon macOS, x86-64 Linux, and
+64-bit Windows. On macOS or Linux, download the binary and Wiki database:
 
 ```sh
 mkdir osrs-search && cd osrs-search
 BASE=https://github.com/m8aq/osrs-wiki-cache-utils/releases/latest/download
-curl -fL "$BASE/osrs-wiki-offline-aarch64-apple-darwin" -o osrs-wiki-offline
+# Linux: replace aarch64-apple-darwin with x86_64-unknown-linux-musl
+curl -fL "$BASE/osrs-wiki-cache-utils-aarch64-apple-darwin" -o osrs-wiki-cache-utils
 curl -fLO "$BASE/wiki.sqlite"
-chmod +x osrs-wiki-offline
+chmod +x osrs-wiki-cache-utils
 
-./osrs-wiki-offline search \
+./osrs-wiki-cache-utils search \
   --database wiki.sqlite \
   "Blast Furnace coal bag ice gloves"
+```
+
+On Windows PowerShell:
+
+```powershell
+mkdir osrs-search; cd osrs-search
+$base = "https://github.com/m8aq/osrs-wiki-cache-utils/releases/latest/download"
+Invoke-WebRequest "$base/osrs-wiki-cache-utils-x86_64-pc-windows-msvc.exe" -OutFile osrs-wiki-cache-utils.exe
+Invoke-WebRequest "$base/wiki.sqlite" -OutFile wiki.sqlite
+.\osrs-wiki-cache-utils.exe search --database wiki.sqlite "Blast Furnace coal bag ice gloves"
 ```
 
 For decoded game-cache search, also download `cache.sqlite`:
@@ -35,7 +46,7 @@ For decoded game-cache search, also download `cache.sqlite`:
 ```sh
 curl -fLO "$BASE/cache.sqlite"
 
-./osrs-wiki-offline cache-search \
+./osrs-wiki-cache-utils cache-search \
   --database wiki.sqlite \
   --cache-database cache.sqlite \
   --kind config/obj \
@@ -54,10 +65,10 @@ Progress is printed throughout both operations.
 cargo build --release
 
 # Fetch revision-pinned Parsoid HTML.
-target/release/osrs-wiki-offline snapshot --output snapshot
+target/release/osrs-wiki-cache-utils snapshot --output snapshot
 
 # Build the Wiki search database. Interrupted builds resume automatically.
-target/release/osrs-wiki-offline index \
+target/release/osrs-wiki-cache-utils index \
   --snapshot snapshot \
   --database wiki.sqlite
 ```
@@ -78,7 +89,7 @@ GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 \
   https://github.com/Joshua-F/osrs-dumps.git cache-dump
 CACHE_COMMIT=$(git -C cache-dump rev-parse HEAD)
 
-target/release/osrs-wiki-offline cache-index \
+target/release/osrs-wiki-cache-utils cache-index \
   --cache-dump cache-dump \
   --cache-commit "$CACHE_COMMIT" \
   --database cache.sqlite
@@ -90,17 +101,17 @@ distributed independently.
 ## Search
 
 ```sh
-target/release/osrs-wiki-offline search \
+target/release/osrs-wiki-cache-utils search \
   --database wiki.sqlite \
   "charged bow ranged strength"
 
-target/release/osrs-wiki-offline cache-search \
+target/release/osrs-wiki-cache-utils cache-search \
   --database wiki.sqlite \
   --cache-database cache.sqlite \
   --kind config/obj \
   "abyssal whip destroy option"
 
-target/release/osrs-wiki-offline cache-get \
+target/release/osrs-wiki-cache-utils cache-get \
   --database wiki.sqlite \
   --cache-database cache.sqlite \
   config/obj 4151
@@ -125,7 +136,7 @@ prefer exact IDs, symbols, names, and a `--kind` filter. Generic words such as
 Run the stdio server:
 
 ```sh
-target/release/osrs-wiki-offline serve \
+target/release/osrs-wiki-cache-utils serve \
   --database /absolute/path/wiki.sqlite \
   --cache-database /absolute/path/cache.sqlite
 ```
@@ -136,7 +147,7 @@ MCP client configuration:
 {
   "mcpServers": {
     "osrs": {
-      "command": "/absolute/path/osrs-wiki-offline",
+      "command": "/absolute/path/osrs-wiki-cache-utils",
       "args": [
         "serve",
         "--database", "/absolute/path/wiki.sqlite",
@@ -167,7 +178,7 @@ pages and cache records are reused. Interrupted initial builds resume from the
 last committed page or cache batch.
 
 ```sh
-target/release/osrs-wiki-offline verify \
+target/release/osrs-wiki-cache-utils verify \
   --snapshot snapshot \
   --database wiki.sqlite \
   --cache-database cache.sqlite
