@@ -9,10 +9,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use index::{
-    CacheIndexOptions, IndexOptions, SearchEngine, build_cache_index, build_index,
-    verify_cache_index, verify_index,
-};
+use index::{SearchEngine, build_cache_index, build_index, verify_cache_index, verify_index};
 use mcp::OfflineWiki;
 use rmcp::{ServiceExt, transport::stdio};
 use snapshot::{SnapshotOptions, build_snapshot, verify_snapshot};
@@ -39,10 +36,6 @@ enum Command {
         concurrency: usize,
         #[arg(long = "title")]
         titles: Vec<String>,
-        #[arg(long, requires = "shard_count")]
-        shard_index: Option<usize>,
-        #[arg(long, requires = "shard_index")]
-        shard_count: Option<usize>,
     },
     Index {
         #[arg(long)]
@@ -108,16 +101,12 @@ async fn main() -> Result<()> {
             requests_per_second,
             concurrency,
             titles,
-            shard_index,
-            shard_count,
         } => {
             let metadata = build_snapshot(SnapshotOptions {
                 output,
                 requests_per_second,
                 concurrency,
                 titles,
-                shard_index,
-                shard_count,
             })
             .await?;
             eprintln!(
@@ -125,16 +114,12 @@ async fn main() -> Result<()> {
                 metadata.included_pages, metadata.excluded_pages
             );
         }
-        Command::Index { snapshot, database } => build_index(IndexOptions { snapshot, database })?,
+        Command::Index { snapshot, database } => build_index(&snapshot, &database)?,
         Command::CacheIndex {
             database,
             cache_dump,
             cache_commit,
-        } => build_cache_index(CacheIndexOptions {
-            database,
-            cache_dump,
-            cache_commit,
-        })?,
+        } => build_cache_index(&database, &cache_dump, &cache_commit)?,
         Command::Serve {
             database,
             cache_database,
@@ -148,7 +133,7 @@ async fn main() -> Result<()> {
             query,
             limit,
         } => {
-            let output = SearchEngine::open(&database, None)?.search(&query, limit, 0)?;
+            let output = SearchEngine::open(&database, None)?.search(&query, limit)?;
             println!("{}", serde_json::to_string_pretty(&output)?);
         }
         Command::CacheSearch {
@@ -161,7 +146,6 @@ async fn main() -> Result<()> {
             let output = SearchEngine::open(&database, Some(&cache_database))?.search_cache(
                 &query,
                 limit,
-                0,
                 kind.as_deref(),
             )?;
             println!("{}", serde_json::to_string_pretty(&output)?);

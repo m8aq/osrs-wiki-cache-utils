@@ -45,10 +45,6 @@ pub struct SnapshotMetadata {
     pub completed_at: String,
     pub wiki_origin: String,
     pub namespaces: Vec<i64>,
-    #[serde(default)]
-    pub shard_index: Option<usize>,
-    #[serde(default)]
-    pub shard_count: Option<usize>,
     pub enumerated_pages: usize,
     pub included_pages: usize,
     pub excluded_pages: usize,

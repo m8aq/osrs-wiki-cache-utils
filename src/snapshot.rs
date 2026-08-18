@@ -32,8 +32,6 @@ pub struct SnapshotOptions {
     pub requests_per_second: f64,
     pub concurrency: usize,
     pub titles: Vec<String>,
-    pub shard_index: Option<usize>,
-    pub shard_count: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,7 +148,6 @@ pub async fn build_snapshot(options: SnapshotOptions) -> Result<SnapshotMetadata
     if options.concurrency == 0 {
         bail!("concurrency must be greater than zero");
     }
-    let shard = validate_shard(options.shard_index, options.shard_count)?;
     fs::create_dir_all(options.output.join("pages/0"))?;
     fs::create_dir_all(options.output.join("pages/120"))?;
     let started_at = Utc::now().to_rfc3339();
@@ -170,9 +167,6 @@ pub async fn build_snapshot(options: SnapshotOptions) -> Result<SnapshotMetadata
     } else {
         resolve_titles(&http, &options.titles).await?
     };
-    if let Some((index, count)) = shard {
-        pages.retain(|page| page_shard(page.page_id, count) == index);
-    }
     pages.sort_by(|left, right| left.title.cmp(&right.title));
     let aliases = enumerate_aliases(&http, &pages).await?;
 
@@ -229,8 +223,6 @@ pub async fn build_snapshot(options: SnapshotOptions) -> Result<SnapshotMetadata
         completed_at: Utc::now().to_rfc3339(),
         wiki_origin: WIKI_ORIGIN.to_string(),
         namespaces: NAMESPACES.to_vec(),
-        shard_index: shard.map(|value| value.0),
-        shard_count: shard.map(|value| value.1),
         enumerated_pages: pages.len(),
         included_pages: included.len(),
         excluded_pages: excluded.len(),
@@ -262,20 +254,6 @@ fn write_snapshot_progress(
         "snapshot incomplete: {} page(s) failed; rerun to resume",
         failures.len()
     )
-}
-
-fn validate_shard(index: Option<usize>, count: Option<usize>) -> Result<Option<(usize, usize)>> {
-    match (index, count) {
-        (None, None) => Ok(None),
-        (Some(index), Some(count)) if count > 0 && index < count => Ok(Some((index, count))),
-        (Some(_), Some(0)) => bail!("shard count must be greater than zero"),
-        (Some(index), Some(count)) => bail!("shard index {index} must be less than count {count}"),
-        _ => bail!("shard index and shard count must be provided together"),
-    }
-}
-
-fn page_shard(page_id: i64, count: usize) -> usize {
-    page_id.unsigned_abs() as usize % count
 }
 
 async fn enumerate_pages(http: &WikiHttp) -> Result<Vec<EnumeratedPage>> {
@@ -749,18 +727,5 @@ mod tests {
             &page
         ));
         assert!(!page_is_unchanged(3, &Some(page.touched_at.clone()), &page));
-    }
-
-    #[test]
-    fn shards_partition_page_ids_exactly_once() {
-        for page_id in 1..10_000 {
-            let memberships = (0..32)
-                .filter(|index| page_shard(page_id, 32) == *index)
-                .count();
-            assert_eq!(memberships, 1);
-        }
-        assert_eq!(validate_shard(Some(31), Some(32)).unwrap(), Some((31, 32)));
-        assert!(validate_shard(Some(32), Some(32)).is_err());
-        assert!(validate_shard(Some(0), None).is_err());
     }
 }

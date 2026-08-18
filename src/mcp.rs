@@ -19,7 +19,6 @@ use crate::index::{
 pub struct SearchRequest {
     pub query: String,
     pub limit: Option<usize>,
-    pub offset: Option<usize>,
 }
 
 /// Searches decoded cache records, optionally restricting the record kind.
@@ -27,7 +26,6 @@ pub struct SearchRequest {
 pub struct CacheSearchRequest {
     pub query: String,
     pub limit: Option<usize>,
-    pub offset: Option<usize>,
     pub kind: Option<String>,
 }
 
@@ -85,14 +83,8 @@ impl OfflineWiki {
         &self,
         Parameters(request): Parameters<SearchRequest>,
     ) -> Result<Json<UnifiedSearchOutput>, String> {
-        self.with_engine(|engine| {
-            engine.search_unified(
-                &request.query,
-                request.limit.unwrap_or(5),
-                request.offset.unwrap_or(0),
-            )
-        })
-        .map(Json)
+        self.with_engine(|engine| engine.search_unified(&request.query, request.limit.unwrap_or(5)))
+            .map(Json)
     }
 
     #[tool(
@@ -103,14 +95,8 @@ impl OfflineWiki {
         &self,
         Parameters(request): Parameters<SearchRequest>,
     ) -> Result<Json<SearchOutput>, String> {
-        self.with_engine(|engine| {
-            engine.search(
-                &request.query,
-                request.limit.unwrap_or(5),
-                request.offset.unwrap_or(0),
-            )
-        })
-        .map(Json)
+        self.with_engine(|engine| engine.search(&request.query, request.limit.unwrap_or(5)))
+            .map(Json)
     }
 
     #[tool(
@@ -125,7 +111,6 @@ impl OfflineWiki {
             engine.search_cache(
                 &request.query,
                 request.limit.unwrap_or(5),
-                request.offset.unwrap_or(0),
                 request.kind.as_deref(),
             )
         })

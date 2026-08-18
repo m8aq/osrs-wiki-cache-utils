@@ -2,7 +2,7 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     process::Command,
 };
 
@@ -24,24 +24,11 @@ use crate::{
 const TEXT_CAP: usize = 16_000;
 const SECTION_CAP: usize = 200;
 const CANDIDATE_LIMIT: usize = 50;
-const RRF_K: f32 = 60.0;
 const CACHE_BATCH_SIZE: usize = 1_000;
 const SQLITE_CACHE_KIB: i64 = 32 * 1024;
 const LEXICAL_SQL: &str = "SELECT chunks_fts.rowid FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid JOIN pages p ON p.id = c.page_id LEFT JOIN cache_entries ce ON ce.page_id = p.id WHERE chunks_fts MATCH ?1 AND (?2 IS NULL OR p.source_kind = ?2) AND (?3 IS NULL OR ce.kind = ?3 COLLATE NOCASE) ORDER BY bm25(chunks_fts, 10.0, 4.0, 1.0) LIMIT ?4";
 const RECOVERY_WARNING: &str =
     "Derived retrieval text; lossless Parsoid HTML is retained in the Wiki database.";
-
-pub struct IndexOptions {
-    pub snapshot: PathBuf,
-    pub database: PathBuf,
-}
-
-/// Inputs for building the standalone decoded game-cache search database.
-pub struct CacheIndexOptions {
-    pub database: PathBuf,
-    pub cache_dump: PathBuf,
-    pub cache_commit: String,
-}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -89,9 +76,6 @@ pub struct SearchResultRow {
 pub struct SearchOutput {
     pub results: Vec<SearchResultRow>,
     pub total: usize,
-    pub offset: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_offset: Option<usize>,
     pub provenance: Provenance,
 }
 
@@ -101,9 +85,6 @@ pub struct SearchOutput {
 pub struct UnifiedSearchOutput {
     pub results: Vec<SearchResultRow>,
     pub total: usize,
-    pub offset: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_offset: Option<usize>,
     pub provenance: Vec<Provenance>,
 }
 
@@ -113,8 +94,6 @@ pub struct SectionSummary {
     pub index: i64,
     pub name: String,
     pub level: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub anchor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -135,7 +114,6 @@ pub struct SectionsOutput {
     pub title: String,
     pub sections: Vec<SectionSummary>,
     pub total: usize,
-    pub returned: usize,
     pub truncated: bool,
     pub warnings: Vec<String>,
     pub provenance: Provenance,
@@ -188,27 +166,15 @@ pub struct SearchEngine {
     cache: Option<CacheMetadata>,
 }
 
-pub fn build_index(options: IndexOptions) -> Result<()> {
+pub fn build_index(snapshot: &Path, database: &Path) -> Result<()> {
     eprintln!("index phase: verify snapshot");
-    let metadata = verify_snapshot(&options.snapshot)?;
-    let pages: Vec<PageManifest> = read_json_lines(&options.snapshot.join("manifest.jsonl"))?;
-    let aliases: Vec<AliasManifest> = read_json_lines(&options.snapshot.join("aliases.jsonl"))?;
-    if options.database.exists() && current_schema(&options.database)? {
-        update_index(
-            &options.snapshot,
-            &options.database,
-            &metadata,
-            &pages,
-            &aliases,
-        )
+    let metadata = verify_snapshot(snapshot)?;
+    let pages: Vec<PageManifest> = read_json_lines(&snapshot.join("manifest.jsonl"))?;
+    let aliases: Vec<AliasManifest> = read_json_lines(&snapshot.join("aliases.jsonl"))?;
+    if database.exists() && current_schema(database)? {
+        update_index(snapshot, database, &metadata, &pages, &aliases)
     } else {
-        build_new_index(
-            &options.snapshot,
-            &options.database,
-            &metadata,
-            &pages,
-            &aliases,
-        )
+        build_new_index(snapshot, database, &metadata, &pages, &aliases)
     }
 }
 
@@ -360,10 +326,10 @@ fn update_index(
 }
 
 /// Builds or incrementally updates the standalone decoded game-cache index.
-pub fn build_cache_index(options: CacheIndexOptions) -> Result<()> {
-    let cache = read_cache_dump(&options.cache_dump, &options.cache_commit)?;
-    if options.database.exists() && current_schema(&options.database)? {
-        let mut connection = Connection::open(&options.database)?;
+pub fn build_cache_index(database: &Path, cache_dump: &Path, cache_commit: &str) -> Result<()> {
+    let cache = read_cache_dump(cache_dump, cache_commit)?;
+    if database.exists() && current_schema(database)? {
+        let mut connection = Connection::open(database)?;
         let transaction = connection.transaction()?;
         let counts = update_cache(&transaction, &cache)?;
         transaction.commit()?;
@@ -376,7 +342,7 @@ pub fn build_cache_index(options: CacheIndexOptions) -> Result<()> {
         return Ok(());
     }
 
-    if let Some(parent) = options.database.parent() {
+    if let Some(parent) = database.parent() {
         fs::create_dir_all(parent)?;
     }
     let required = cache
@@ -385,8 +351,8 @@ pub fn build_cache_index(options: CacheIndexOptions) -> Result<()> {
         .map(|document| document.content.len() as u64)
         .sum::<u64>()
         .saturating_mul(2);
-    require_free_space(&options.database, required)?;
-    let temporary = options.database.with_extension("sqlite.part");
+    require_free_space(database, required)?;
+    let temporary = database.with_extension("sqlite.part");
     let mut connection = Connection::open(&temporary)?;
     if current_schema(&temporary)? {
         let stored: CacheMetadata = serde_json::from_str(&connection.query_row(
@@ -432,7 +398,7 @@ pub fn build_cache_index(options: CacheIndexOptions) -> Result<()> {
     verify_page_count(&connection, "cache", cache.documents.len())?;
     connection.execute_batch("PRAGMA optimize;")?;
     drop(connection);
-    fs::rename(&temporary, &options.database)?;
+    fs::rename(&temporary, database)?;
     eprintln!("cache index complete: {} entries", cache.documents.len());
     Ok(())
 }
@@ -825,8 +791,8 @@ impl SearchEngine {
         })
     }
 
-    pub fn search(&self, query: &str, limit: usize, offset: usize) -> Result<SearchOutput> {
-        self.search_source(query, limit, offset, "wiki", None)
+    pub fn search(&self, query: &str, limit: usize) -> Result<SearchOutput> {
+        self.search_source(query, limit, "wiki", None)
     }
 
     /// Searches decoded, revision-pinned game-cache records, optionally by kind.
@@ -834,7 +800,6 @@ impl SearchEngine {
         &self,
         query: &str,
         limit: usize,
-        offset: usize,
         kind: Option<&str>,
     ) -> Result<SearchOutput> {
         if self.cache.is_none() {
@@ -844,16 +809,11 @@ impl SearchEngine {
         if kind == Some("") {
             bail!("cache kind must be non-empty");
         }
-        self.search_source(query, limit, offset, "cache", kind)
+        self.search_source(query, limit, "cache", kind)
     }
 
     /// Searches all indexed Wiki and game-cache content in one ranking.
-    pub fn search_unified(
-        &self,
-        query: &str,
-        limit: usize,
-        offset: usize,
-    ) -> Result<UnifiedSearchOutput> {
+    pub fn search_unified(&self, query: &str, limit: usize) -> Result<UnifiedSearchOutput> {
         validate_search(query, limit)?;
         let wiki = self.rank_rows(&self.connection, query, "wiki", None)?;
         let cache = self
@@ -872,12 +832,7 @@ impl SearchEngine {
                 .then_with(|| left.title.cmp(&right.title))
         });
         let total = rows.len();
-        let results = rows
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .collect::<Vec<_>>();
-        let next_offset = (offset + results.len() < total).then_some(offset + results.len());
+        let results = rows.into_iter().take(limit).collect::<Vec<_>>();
         let (wiki_rows, cache_rows): (Vec<_>, Vec<_>) =
             results.iter().partition(|row| row.source == "wiki");
         let wiki_sources = wiki_rows
@@ -909,8 +864,6 @@ impl SearchEngine {
         Ok(UnifiedSearchOutput {
             results,
             total,
-            offset,
-            next_offset,
             provenance,
         })
     }
@@ -919,7 +872,6 @@ impl SearchEngine {
         &self,
         query: &str,
         limit: usize,
-        offset: usize,
         source_kind: &str,
         cache_kind: Option<&str>,
     ) -> Result<SearchOutput> {
@@ -933,12 +885,7 @@ impl SearchEngine {
         };
         let rows = self.rank_rows(connection, query, source_kind, cache_kind)?;
         let total = rows.len();
-        let results = rows
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .collect::<Vec<_>>();
-        let next_offset = (offset + results.len() < total).then_some(offset + results.len());
+        let results = rows.into_iter().take(limit).collect::<Vec<_>>();
         let sources = results
             .iter()
             .map(|row| {
@@ -949,8 +896,6 @@ impl SearchEngine {
         Ok(SearchOutput {
             results,
             total,
-            offset,
-            next_offset,
             provenance: self.provenance(source_kind, sources),
         })
     }
@@ -964,28 +909,30 @@ impl SearchEngine {
     ) -> Result<Vec<SearchResultRow>> {
         let query = query.trim();
         let lexical = self.lexical_candidates(connection, query, source_kind, cache_kind)?;
-        let exact_pages = self
+        let exact_chunk = self
             .resolve_page_id(connection, query, source_kind, cache_kind)?
-            .into_iter()
-            .collect::<Vec<_>>();
-        let mut scores: HashMap<i64, f32> = HashMap::new();
-        for (rank, chunk_id) in lexical.iter().enumerate() {
-            *scores.entry(*chunk_id).or_default() += 1.0 / (RRF_K + rank as f32 + 1.0);
+            .map(|page_id| {
+                connection
+                    .query_row(
+                        "SELECT id FROM chunks WHERE page_id = ?1 ORDER BY id LIMIT 1",
+                        [page_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+            })
+            .transpose()?
+            .flatten();
+        let mut ranked = Vec::with_capacity(lexical.len() + usize::from(exact_chunk.is_some()));
+        if let Some(chunk_id) = exact_chunk {
+            ranked.push((chunk_id, 1.0));
         }
-        for page_id in exact_pages {
-            let chunk_id: Option<i64> = connection
-                .query_row(
-                    "SELECT id FROM chunks WHERE page_id = ?1 ORDER BY id LIMIT 1",
-                    [page_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(chunk_id) = chunk_id {
-                *scores.entry(chunk_id).or_default() += 1.0;
-            }
-        }
-        let mut ranked = scores.into_iter().collect::<Vec<_>>();
-        ranked.sort_by(|left, right| right.1.partial_cmp(&left.1).unwrap_or(Ordering::Equal));
+        ranked.extend(
+            lexical
+                .into_iter()
+                .enumerate()
+                .filter(|(_, chunk_id)| Some(*chunk_id) != exact_chunk)
+                .map(|(rank, chunk_id)| (chunk_id, 1.0 / (rank as f32 + 2.0))),
+        );
 
         let mut seen_pages = HashSet::new();
         let mut rows = Vec::new();
@@ -1031,7 +978,6 @@ impl SearchEngine {
                 index: *index,
                 name: heading.clone(),
                 level: *level,
-                anchor: None,
             })
             .collect::<Vec<_>>();
         let mut warnings = vec![RECOVERY_WARNING.to_string()];
@@ -1059,17 +1005,11 @@ impl SearchEngine {
         let sections = rows
             .into_iter()
             .take(SECTION_CAP)
-            .map(|(index, level, name, _)| SectionSummary {
-                index,
-                name,
-                level,
-                anchor: None,
-            })
+            .map(|(index, level, name, _)| SectionSummary { index, name, level })
             .collect::<Vec<_>>();
         let truncated = total > sections.len();
         Ok(SectionsOutput {
             title: page.title.clone(),
-            returned: sections.len(),
             sections,
             total,
             truncated,
@@ -1645,8 +1585,6 @@ mod tests {
             completed_at: String::new(),
             wiki_origin: WIKI_ORIGIN.to_string(),
             namespaces: vec![0, 120],
-            shard_index: None,
-            shard_count: None,
             enumerated_pages: 1,
             included_pages: 1,
             excluded_pages: 0,
@@ -1687,8 +1625,9 @@ mod tests {
         drop(cache);
 
         let engine = SearchEngine::open(&wiki_path, Some(&cache_path)).unwrap();
-        let output = engine.search_unified("abyssal whip", 5, 0).unwrap();
+        let output = engine.search_unified("abyssal whip", 5).unwrap();
         assert_eq!(output.results.len(), 2);
+        assert_eq!(output.results[0].title, "Abyssal whip");
         assert!(output.results.iter().any(|row| row.source == "wiki"));
         assert!(output.results.iter().any(|row| row.source == "cache"));
     }
@@ -1707,8 +1646,6 @@ mod tests {
             completed_at: String::new(),
             wiki_origin: WIKI_ORIGIN.to_string(),
             namespaces: vec![0],
-            shard_index: None,
-            shard_count: None,
             enumerated_pages: 1,
             included_pages: 1,
             excluded_pages: 0,
