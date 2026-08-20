@@ -1,6 +1,6 @@
 [package]
 name = "osrs-wiki-cache-utils"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MIT"
 description = "Build and search offline OSRS Wiki, game-cache, and RuneLite source indexes"

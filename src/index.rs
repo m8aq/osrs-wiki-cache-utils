@@ -30,6 +30,60 @@ const CANDIDATE_LIMIT: usize = 50;
 const CACHE_BATCH_SIZE: usize = 1_000;
 const SQLITE_CACHE_KIB: i64 = 32 * 1024;
 const SCHEMA_VERSION: i64 = 1;
+const EXCLUDED_WIKI_TITLES: &[&str] = &[
+    "Botting",
+    "Code of Conduct",
+    "Free-to-play PvP",
+    "Free-to-play PvP culture",
+    "Game Requirements",
+    "Game client",
+    "HDOS",
+    "Mouse keys",
+    "OSBuddy",
+    "RuneLite",
+];
+const EXCLUDED_CODE_ENTRIES: &[(&str, &str)] = &[
+    (
+        "pluginhub/alch-hero",
+        "src/main/java/com/alchhero/AlchHeroPlugin.java",
+    ),
+    (
+        "pluginhub/emote-wheel",
+        "src/main/java/com/zezizaza/emotewheel/EmoteWheelPlugin.java",
+    ),
+    (
+        "pluginhub/grand-flip-out",
+        "src/main/java/com/fliphelper/GrandFlipOutPlugin.java",
+    ),
+    (
+        "pluginhub/guide-overlay",
+        "src/main/java/com/hcimguide/BankTagIntegration.java",
+    ),
+    (
+        "pluginhub/gustav-helper",
+        "src/main/java/com/gustavguide/engine/ledger/ItemLedger.java",
+    ),
+    (
+        "pluginhub/persistent-bank",
+        "src/main/java/com/persistentbank/PersistentBankPlugin.java",
+    ),
+    (
+        "pluginhub/prayer-icons-overlay",
+        "src/main/java/com/jashyard/prayericons/PrayerIconsPlugin.java",
+    ),
+    (
+        "pluginhub/skedpojkar",
+        "src/main/java/com/skedpojkar/panel/WelcomePanel.java",
+    ),
+    (
+        "pluginhub/solo-ironman-strategist",
+        "src/main/java/com/soloironman/ShopOverlay.java",
+    ),
+    (
+        "pluginhub/tyrs-guard-clan",
+        "src/main/java/com/tyrsguard/TyrsGuardPlugin.java",
+    ),
+];
 const LEXICAL_SQL: &str = "SELECT chunks_fts.rowid FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid LEFT JOIN cache_entries ce ON ce.page_id = c.page_id WHERE chunks_fts MATCH ?1 AND (?2 IS NULL OR ce.kind = ?2 COLLATE NOCASE) ORDER BY bm25(chunks_fts, 10.0, 4.0, 1.0) LIMIT ?3";
 const RECOVERY_WARNING: &str =
     "Derived retrieval text; lossless Parsoid HTML is retained in the Wiki database.";
@@ -177,9 +231,22 @@ pub struct SearchEngine {
 
 pub fn build_index(snapshot: &Path, database: &Path) -> Result<()> {
     eprintln!("index phase: verify snapshot");
-    let metadata = verify_snapshot(snapshot)?;
-    let pages: Vec<PageManifest> = read_json_lines(&snapshot.join("manifest.jsonl"))?;
-    let aliases: Vec<AliasManifest> = read_json_lines(&snapshot.join("aliases.jsonl"))?;
+    let mut metadata = verify_snapshot(snapshot)?;
+    let all_pages: Vec<PageManifest> = read_json_lines(&snapshot.join("manifest.jsonl"))?;
+    let pages: Vec<PageManifest> = all_pages
+        .into_iter()
+        .filter(|page| !excluded_wiki_title(&page.title))
+        .collect();
+    let aliases: Vec<AliasManifest> =
+        read_json_lines::<AliasManifest>(&snapshot.join("aliases.jsonl"))?
+            .into_iter()
+            .filter(|alias| !excluded_wiki_title(&alias.target))
+            .collect();
+    metadata.excluded_pages = metadata
+        .excluded_pages
+        .saturating_add(metadata.included_pages.saturating_sub(pages.len()));
+    metadata.included_pages = pages.len();
+    metadata.aliases = aliases.len();
     if database.exists() && current_schema(database, "wiki")? {
         update_index(snapshot, database, &metadata, &pages, &aliases)
     } else {
@@ -425,7 +492,7 @@ pub fn build_code_index(
     http_api_repo: &Path,
     http_api_commit: &str,
 ) -> Result<()> {
-    let code = read_code_sources(
+    let mut code = read_code_sources(
         pluginhub_repo,
         pluginhub_commit,
         runelite_repo,
@@ -435,6 +502,9 @@ pub fn build_code_index(
         http_api_repo,
         http_api_commit,
     )?;
+    code.documents
+        .retain(|document| !excluded_code_entry(&document.kind, &document.id));
+    code.metadata.entries = code.documents.len();
     if database.exists() && current_schema(database, "code")? {
         let mut connection = Connection::open(database)?;
         let transaction = connection.transaction()?;
@@ -1521,7 +1591,11 @@ pub fn verify_index(database: &Path, snapshot: &Path) -> Result<()> {
         [],
         |row| row.get::<_, String>(0),
     )?)?;
-    let pages: Vec<PageManifest> = read_json_lines(&snapshot.join("manifest.jsonl"))?;
+    let pages: Vec<PageManifest> =
+        read_json_lines::<PageManifest>(&snapshot.join("manifest.jsonl"))?
+            .into_iter()
+            .filter(|page| !excluded_wiki_title(&page.title))
+            .collect();
     verify_page_count(&connection, "wiki", pages.len())?;
     let expected = pages
         .into_iter()
@@ -1699,6 +1773,14 @@ fn source(page: &PageRow) -> SourceRef {
     }
 }
 
+fn excluded_wiki_title(title: &str) -> bool {
+    EXCLUDED_WIKI_TITLES.contains(&title)
+}
+
+fn excluded_code_entry(kind: &str, id: &str) -> bool {
+    EXCLUDED_CODE_ENTRIES.contains(&(kind, id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1706,6 +1788,20 @@ mod tests {
     #[test]
     fn fts_input_is_quoted() {
         assert_eq!(fts_query("bow (charged)"), "\"bow\"* OR \"charged\"*");
+    }
+
+    #[test]
+    fn content_exclusions_are_exact() {
+        assert!(excluded_wiki_title("RuneLite"));
+        assert!(!excluded_wiki_title("Guardians of the Rift"));
+        assert!(excluded_code_entry(
+            "pluginhub/alch-hero",
+            "src/main/java/com/alchhero/AlchHeroPlugin.java"
+        ));
+        assert!(!excluded_code_entry(
+            "runelite-client",
+            "runelite-client/src/main/java/net/runelite/client/RuneLite.java"
+        ));
     }
 
     #[test]

@@ -28,7 +28,7 @@ No Rust toolchain or indexing is needed.
 ```sh
 mkdir -p "$HOME/Documents/osrs" && cd "$HOME/Documents/osrs"
 BASE=https://github.com/m8aq/osrs-wiki-cache-utils/releases/latest/download
-curl -fL "$BASE/osrs-wiki-cache-utils-v0.2.0-aarch64-apple-darwin" -o osrs-wiki-cache-utils
+curl -fL "$BASE/osrs-wiki-cache-utils-v0.2.1-aarch64-apple-darwin" -o osrs-wiki-cache-utils
 curl -fLO "$BASE/wiki.sqlite"
 chmod +x osrs-wiki-cache-utils
 ```
@@ -38,7 +38,7 @@ chmod +x osrs-wiki-cache-utils
 ```sh
 mkdir -p "$HOME/Documents/osrs" && cd "$HOME/Documents/osrs"
 BASE=https://github.com/m8aq/osrs-wiki-cache-utils/releases/latest/download
-curl -fL "$BASE/osrs-wiki-cache-utils-v0.2.0-x86_64-unknown-linux-musl" -o osrs-wiki-cache-utils
+curl -fL "$BASE/osrs-wiki-cache-utils-v0.2.1-x86_64-unknown-linux-musl" -o osrs-wiki-cache-utils
 curl -fLO "$BASE/wiki.sqlite"
 chmod +x osrs-wiki-cache-utils
 ```
@@ -49,7 +49,7 @@ chmod +x osrs-wiki-cache-utils
 New-Item -ItemType Directory -Force "$HOME\Documents\osrs" | Out-Null
 Set-Location "$HOME\Documents\osrs"
 $base = "https://github.com/m8aq/osrs-wiki-cache-utils/releases/latest/download"
-Invoke-WebRequest "$base/osrs-wiki-cache-utils-v0.2.0-x86_64-pc-windows-msvc.exe" -OutFile osrs-wiki-cache-utils.exe
+Invoke-WebRequest "$base/osrs-wiki-cache-utils-v0.2.1-x86_64-pc-windows-msvc.exe" -OutFile osrs-wiki-cache-utils.exe
 Invoke-WebRequest "$base/wiki.sqlite" -OutFile wiki.sqlite
 ```
 
@@ -158,6 +158,9 @@ $BIN index --snapshot snapshot --database wiki.sqlite
 The snapshot contains revision-pinned Parsoid HTML from current Main and
 Transcript pages. Raw HTML is preserved. Explicitly historical, removed,
 obsolete, and discontinued pages are excluded.
+
+Generated Wiki and code indexes also apply the fixed content exclusions in
+`src/index.rs`. These exclusions are applied to both new and incremental builds.
 
 To build `cache.sqlite` from
 [`Joshua-F/osrs-dumps`](https://github.com/Joshua-F/osrs-dumps):
