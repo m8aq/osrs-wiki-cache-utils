@@ -19,6 +19,7 @@ use crate::{
     code::{
         CodeDocument, CodeMetadata, CodeSnapshot, PLUGINHUB_SEARCHER_ORIGIN, read_code_sources,
     },
+    equipment,
     extract::{chunks_for_section, extract_page},
     model::{AliasManifest, PageManifest, SnapshotMetadata},
     snapshot::{read_json_lines, verify_snapshot},
@@ -254,6 +255,26 @@ pub fn build_index(snapshot: &Path, database: &Path) -> Result<()> {
     }
 }
 
+/// Rebuilds equipment requirements from pages already stored in a Wiki index.
+pub fn build_equipment_index(database: &Path) -> Result<()> {
+    if !database.exists() || !current_schema(database, "wiki")? {
+        bail!("{} is not a compatible Wiki index", database.display());
+    }
+    let mut connection = Connection::open(database)?;
+    let transaction = connection.transaction()?;
+    equipment::create_schema(&transaction)?;
+    equipment::rebuild(&transaction)?;
+    let items: i64 =
+        transaction.query_row("SELECT count(*) FROM equipment_items", [], |row| row.get(0))?;
+    let requirements: i64 =
+        transaction.query_row("SELECT count(*) FROM equipment_requirements", [], |row| {
+            row.get(0)
+        })?;
+    transaction.commit()?;
+    eprintln!("equipment index complete: {items} items, {requirements} requirements");
+    Ok(())
+}
+
 fn build_new_index(
     snapshot: &Path,
     database: &Path,
@@ -308,6 +329,7 @@ fn build_new_index(
         let transaction = connection.transaction()?;
         transaction.execute("DELETE FROM aliases", [])?;
         insert_aliases(&transaction, aliases)?;
+        equipment::rebuild(&transaction)?;
         transaction.commit()?;
     }
     verify_page_count(&connection, "wiki", pages.len())?;
@@ -327,6 +349,7 @@ fn update_index(
     aliases: &[AliasManifest],
 ) -> Result<()> {
     let mut connection = Connection::open(database)?;
+    equipment::create_schema(&connection)?;
     let existing = {
         let mut statement = connection
             .prepare("SELECT id, revision_id, touched_at, content_sha256, title FROM pages")?;
@@ -384,6 +407,7 @@ fn update_index(
     let transaction = connection.transaction()?;
     transaction.execute("DELETE FROM aliases", [])?;
     insert_aliases(&transaction, aliases)?;
+    equipment::rebuild(&transaction)?;
     transaction.execute(
         "INSERT INTO meta(key, value) VALUES ('snapshot', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [serde_json::to_string(metadata)?],
@@ -918,6 +942,11 @@ fn insert_section(
 }
 
 fn delete_page(transaction: &Transaction<'_>, page_id: i64) -> Result<()> {
+    transaction.execute(
+        "DELETE FROM equipment_requirements WHERE item_id IN (SELECT item_id FROM equipment_items WHERE page_id = ?1)",
+        [page_id],
+    )?;
+    transaction.execute("DELETE FROM equipment_items WHERE page_id = ?1", [page_id])?;
     transaction.execute("DELETE FROM cache_entries WHERE page_id = ?1", [page_id])?;
     transaction.execute("DELETE FROM chunks WHERE page_id = ?1", [page_id])?;
     transaction.execute("DELETE FROM sections WHERE page_id = ?1", [page_id])?;
@@ -1737,6 +1766,7 @@ fn create_schema(connection: &Connection) -> Result<()> {
            INSERT INTO chunks_fts(chunks_fts, rowid, title, heading, text) VALUES ('delete', old.id, old.title, old.heading, old.text);
          END;",
     )?;
+    equipment::create_schema(connection)?;
     connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -1876,6 +1906,160 @@ mod tests {
             )
             .unwrap();
         assert_eq!(target, 2);
+    }
+
+    #[test]
+    fn rebuilds_equipment_requirements_from_indexed_pages() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+        create_schema(&connection).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE equipment_requirements;
+                 CREATE TABLE equipment_requirements(
+                   item_id INTEGER NOT NULL REFERENCES equipment_items(item_id),
+                   context TEXT NOT NULL,
+                   group_id INTEGER NOT NULL,
+                   kind TEXT NOT NULL,
+                   name TEXT NOT NULL,
+                   level INTEGER,
+                   basis TEXT NOT NULL,
+                   evidence TEXT NOT NULL,
+                   PRIMARY KEY(item_id, context, group_id, kind, name)
+                 );",
+            )
+            .unwrap();
+        for (id, title, categories, content) in [
+            (
+                1,
+                "Test Quest",
+                "[\"Quests\"]",
+                "Template:Infobox Item: equipable=No",
+            ),
+            (
+                2,
+                "Test helm",
+                "[\"Equipable items\"]",
+                "Players must have completed Test Quest and require 12 Defence to wear it.\n\nTemplate:Infobox Item: equipable=Yes | id=42 | name=Test helm | options=Wear, Drop",
+            ),
+            (
+                3,
+                "Music cape",
+                "[\"Equipable items\"]",
+                "The cape is obtainable by players who have unlocked all non-holiday music tracks. To trim the music cape, players must unlock all holiday event tracks and have completed all quests.\n\nTemplate:Infobox Item: equipable=Yes | id1=13221 | name1=Music cape | options1=Wear, Drop | id2=13222 | name2=Music cape(t) | options2=Wear, Drop",
+            ),
+            (
+                4,
+                "Slayer helmet",
+                "[\"Equipable items\"]",
+                "Players require 10 Defence to wear the helmet.\n\nTemplate:Infobox Item: equipable=Yes | id=11864 | name=Slayer helmet | options=Wear, Drop",
+            ),
+            (
+                5,
+                "Black slayer helmet",
+                "[\"Equipable items\"]",
+                "It is a cosmetic upgrade to the Slayer helmet.\n\nTemplate:Infobox Item: equipable=Yes | id=19639 | name=Black slayer helmet | options=Wear, Drop",
+            ),
+            (
+                6,
+                "Rune axe",
+                "[\"Equipable items\"]",
+                "Players require 40 Attack to wield the axe.\n\nTemplate:Infobox Item: equipable=Yes | id=1359 | name=Rune axe | options=Wield, Drop",
+            ),
+            (
+                7,
+                "Gilded axe",
+                "[\"Equipable items\"]",
+                "It is a cosmetic variant of the rune axe that can be obtained from Treasure Trails. Players must have completed Test Quest to wield it.\n\nTemplate:Infobox Item: equipable=Yes | id=23279 | name=Gilded axe | options=Wield, Drop",
+            ),
+            (
+                8,
+                "Slayer helmet (i)",
+                "[\"Equipable items\"]",
+                "Players require 10 Defence to wear the helmet.\n\nTemplate:Infobox Item: equipable=Yes | id=11865 | name=Slayer helmet (i) | options=Wear, Drop",
+            ),
+            (
+                9,
+                "Tztok slayer helmet (i)",
+                "[\"Equipable items\"]",
+                "It is a cosmetic variant of the imbued Slayer helmet, styled after TzTok-Jad.\n\nTemplate:Infobox Item: equipable=Yes | id=25902 | name=Tztok slayer helmet (i) | options=Wear, Drop",
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO pages(id, source_kind, namespace, title, revision_id, revision_url, modified_at, fetched_at, url, categories_json, content_sha256, raw_content_zstd) VALUES (?1, 'wiki', 0, ?2, 0, '', '', '', '', ?3, '', X'')",
+                    params![id, title, categories],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO sections(page_id, section_index, level, heading, content) VALUES (?1, 0, 1, 'Lead', ?2)",
+                    params![id, content],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO aliases(alias, page_id) VALUES ('Imbued slayer helmet', 8)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        build_equipment_index(file.path()).unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+
+        let item: (String, String) = connection
+            .query_row(
+                "SELECT name, requirement_status FROM equipment_items WHERE item_id = 42",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(item, ("Test helm".to_string(), "parsed".to_string()));
+        let requirements: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM equipment_requirements WHERE item_id = 42 AND context = 'main' AND group_id = 0 AND ((kind = 'skill' AND name = 'Defence' AND level = 12) OR (kind = 'quest' AND name = 'Test Quest' AND level IS NULL))",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(requirements, 2);
+        let quest_sets = |item_id| {
+            connection
+                .query_row(
+                    "SELECT count(*) FROM equipment_requirements WHERE item_id = ?1 AND kind = 'quest_set'",
+                    [item_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(quest_sets(13221), 0);
+        assert_eq!(quest_sets(13222), 1);
+        for item_id in [19639, 25902] {
+            let inherited: (String, i64) = connection
+                .query_row(
+                    "SELECT ei.requirement_status, count(er.item_id)
+                     FROM equipment_items ei
+                     LEFT JOIN equipment_requirements er ON er.item_id = ei.item_id
+                       AND er.kind = 'skill' AND er.name = 'Defence' AND er.level = 10
+                     WHERE ei.item_id = ?1",
+                    [item_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(inherited, ("parsed".to_string(), 1));
+        }
+        let gilded_axe_requirements: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM equipment_requirements
+                 WHERE item_id = 23279
+                   AND ((kind = 'skill' AND name = 'Attack' AND level = 40)
+                     OR (kind = 'quest' AND name = 'Test Quest'))",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(gilded_axe_requirements, 2);
     }
 
     #[test]

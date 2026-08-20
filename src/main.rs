@@ -1,5 +1,6 @@
 mod cache;
 mod code;
+mod equipment;
 mod extract;
 mod index;
 mod mcp;
@@ -11,8 +12,8 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use index::{
-    SearchEngine, build_cache_index, build_code_index, build_index, verify_cache_index,
-    verify_code_index, verify_index,
+    SearchEngine, build_cache_index, build_code_index, build_equipment_index, build_index,
+    verify_cache_index, verify_code_index, verify_index,
 };
 use mcp::OfflineWiki;
 use rmcp::{ServiceExt, transport::stdio};
@@ -44,6 +45,10 @@ enum Command {
     Index {
         #[arg(long)]
         snapshot: PathBuf,
+        #[arg(long)]
+        database: PathBuf,
+    },
+    EquipmentIndex {
         #[arg(long)]
         database: PathBuf,
     },
@@ -157,6 +162,7 @@ async fn main() -> Result<()> {
             );
         }
         Command::Index { snapshot, database } => build_index(&snapshot, &database)?,
+        Command::EquipmentIndex { database } => build_equipment_index(&database)?,
         Command::CacheIndex {
             database,
             cache_dump,

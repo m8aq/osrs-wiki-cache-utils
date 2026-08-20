@@ -155,6 +155,24 @@ $BIN snapshot --output snapshot
 $BIN index --snapshot snapshot --database wiki.sqlite
 ```
 
+To rebuild only the derived equipment requirement tables from an existing Wiki
+index, without verifying or reading the snapshot again:
+
+```sh
+$BIN equipment-index --database wiki.sqlite
+```
+
+`equipment_items.requirement_status` distinguishes parsed requirements,
+explicitly requirement-free items, and unresolved Wiki prose.
+`equipment_requirements` stores typed requirement atoms with their context,
+evidence, and basis. Group zero atoms are all required; atoms sharing another
+group number are alternatives within that required group. Atom kinds cover
+skills, combat levels, quests, diaries, boss kills, mastery sets, and dynamic
+quest/diary/music-track sets. Version-specific prose such as trimmed-cape
+requirements is attached only to the matching item ID.
+The generated item-level table is checked in at
+[`data/equipment-requirements.json`](data/equipment-requirements.json).
+
 The snapshot contains revision-pinned Parsoid HTML from current Main and
 Transcript pages. Raw HTML is preserved. Explicitly historical, removed,
 obsolete, and discontinued pages are excluded.
