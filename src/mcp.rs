@@ -14,6 +14,7 @@ use crate::index::{
     CacheEntryOutput, CodeEntryOutput, PageOutput, SearchEngine, SearchOutput, SectionOutput,
     SectionsOutput, UnifiedSearchOutput,
 };
+use crate::spawns::SpawnSearchOutput;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchRequest {
@@ -45,6 +46,15 @@ pub struct SectionRequest {
 pub struct RepositoryEntryRequest {
     pub kind: String,
     pub id: String,
+}
+
+/// Exact structured spawn lookup parameters.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SpawnSearchRequest {
+    pub entity: String,
+    pub id: Option<u32>,
+    pub name: Option<String>,
+    pub limit: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -157,6 +167,25 @@ impl OfflineWiki {
     ) -> Result<Json<CodeEntryOutput>, String> {
         self.with_engine(|engine| engine.code_entry(&request.kind, &request.id))
             .map(Json)
+    }
+
+    #[tool(
+        name = "search_spawns",
+        description = "Find structured NPC, object, or ground-item placements by exact case-insensitive name or numeric ID. Results retain source, map ID, plane, coordinates, and unresolved Wiki IDs as null."
+    )]
+    pub async fn search_spawns(
+        &self,
+        Parameters(request): Parameters<SpawnSearchRequest>,
+    ) -> Result<Json<SpawnSearchOutput>, String> {
+        self.with_engine(|engine| {
+            engine.search_spawns(
+                &request.entity,
+                request.id,
+                request.name.as_deref(),
+                request.limit.unwrap_or(50),
+            )
+        })
+        .map(Json)
     }
 
     #[tool(

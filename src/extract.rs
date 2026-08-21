@@ -401,7 +401,7 @@ fn tag_name(node: &Wikinode) -> Option<String> {
         .map(|element| element.name.local.to_string())
 }
 
-fn attrs(node: &Wikinode) -> HashMap<String, String> {
+pub(crate) fn attrs(node: &Wikinode) -> HashMap<String, String> {
     node.as_element()
         .map(|element| {
             element

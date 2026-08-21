@@ -23,6 +23,7 @@ use crate::{
     extract::{chunks_for_section, extract_page},
     model::{AliasManifest, PageManifest, SnapshotMetadata},
     snapshot::{read_json_lines, verify_snapshot},
+    spawns,
 };
 
 const TEXT_CAP: usize = 16_000;
@@ -273,6 +274,33 @@ pub fn build_equipment_index(database: &Path) -> Result<()> {
     transaction.commit()?;
     eprintln!("equipment index complete: {items} items, {requirements} requirements");
     Ok(())
+}
+
+/// Rebuilds structured Wiki spawns and optionally replaces pinned mejrs NPC rows.
+pub fn build_spawn_index(
+    database: &Path,
+    mejrs_json: Option<&Path>,
+    mejrs_commit: Option<&str>,
+) -> Result<(usize, Option<usize>)> {
+    if !database.exists() || !current_schema(database, "wiki")? {
+        bail!("{} is not a compatible Wiki index", database.display());
+    }
+    let mejrs = match (mejrs_json, mejrs_commit) {
+        (Some(path), Some(commit)) => Some((fs::read_to_string(path)?, commit)),
+        (None, None) => None,
+        _ => bail!("--mejrs-json and --mejrs-commit must be provided together"),
+    };
+    let mut connection = Connection::open(database)?;
+    spawns::create_schema(&connection)?;
+    let transaction = connection.transaction()?;
+    let wiki_rows = spawns::rebuild_wiki(&transaction)?;
+    let mejrs_rows = mejrs
+        .as_ref()
+        .map(|(data, commit)| spawns::replace_mejrs(&transaction, data, commit))
+        .transpose()?;
+    transaction.commit()?;
+    connection.execute_batch("PRAGMA optimize;")?;
+    Ok((wiki_rows, mejrs_rows))
 }
 
 fn build_new_index(
@@ -1127,6 +1155,17 @@ impl SearchEngine {
         })
     }
 
+    /// Finds structured NPC, object, or ground-item placements by exact name or ID.
+    pub fn search_spawns(
+        &self,
+        entity_type: &str,
+        entity_id: Option<u32>,
+        name: Option<&str>,
+        limit: usize,
+    ) -> Result<spawns::SpawnSearchOutput> {
+        spawns::search(&self.connection, entity_type, entity_id, name, limit)
+    }
+
     pub fn search(&self, query: &str, limit: usize) -> Result<SearchOutput> {
         self.search_source(&self.connection, query, limit, "wiki", None)
     }
@@ -1832,6 +1871,50 @@ mod tests {
             "runelite-client",
             "runelite-client/src/main/java/net/runelite/client/RuneLite.java"
         ));
+    }
+
+    #[test]
+    fn builds_structured_spawns_in_an_existing_wiki_index() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("wiki.sqlite");
+        let connection = Connection::open(&database).unwrap();
+        create_schema(&connection).unwrap();
+        let snapshot = SnapshotMetadata {
+            snapshot_date: "2026-08-17".to_string(),
+            started_at: String::new(),
+            completed_at: String::new(),
+            wiki_origin: WIKI_ORIGIN.to_string(),
+            namespaces: vec![0, 120],
+            enumerated_pages: 1,
+            included_pages: 1,
+            excluded_pages: 0,
+            aliases: 0,
+            content_license: CONTENT_LICENSE.to_string(),
+            content_license_url: CONTENT_LICENSE_URL.to_string(),
+        };
+        connection
+            .execute(
+                "INSERT INTO meta(key, value) VALUES ('snapshot', ?1)",
+                [serde_json::to_string(&snapshot).unwrap()],
+            )
+            .unwrap();
+        let html = r#"<html><body><span data-mw='{"parts":[{"template":{"target":{"wt":"Infobox NPC"},"params":{"id":{"wt":"1"}}}},{"template":{"target":{"wt":"LocLine"},"params":{"name":{"wt":"Molanisk"},"1":{"wt":"2737,5091"}}}}]}'></span></body></html>"#;
+        connection.execute(
+            "INSERT INTO pages(id, source_kind, namespace, title, revision_id, revision_url, modified_at, touched_at, fetched_at, url, categories_json, content_sha256, raw_content_zstd)
+             VALUES (1, 'wiki', 0, 'Molanisk', 7, 'revision', '', NULL, '', '', '[]', '', ?1)",
+            [zstd::stream::encode_all(html.as_bytes(), 1).unwrap()],
+        ).unwrap();
+        drop(connection);
+
+        assert_eq!(build_spawn_index(&database, None, None).unwrap(), (1, None));
+        let connection = Connection::open(database).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM spawns", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 
     #[test]

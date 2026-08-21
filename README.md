@@ -162,6 +162,33 @@ index, without verifying or reading the snapshot again:
 $BIN equipment-index --database wiki.sqlite
 ```
 
+To add structured NPC, object, and ground-item coordinates from the stored Wiki
+HTML:
+
+```sh
+$BIN spawn-index --database wiki.sqlite
+$BIN spawn-search --database wiki.sqlite --entity npc --name "Citizen"
+$BIN spawn-search --database wiki.sqlite --entity npc --id 10638
+```
+
+Wiki rows retain `mapId`, plane, source URL, and raw template data. `entityId` is
+null when a multi-version Wiki page does not identify which NPC or object ID is
+at a coordinate; the index never guesses that mapping. Coordinates are retained
+exactly, including fractional Wiki map-pin centres that are not literal game
+tiles.
+
+An exact mejrs revision can also be imported for additional NPC rows:
+
+```sh
+curl -fL https://raw.githubusercontent.com/mejrs/data_osrs/6a3ca6f19d65c5609434b51cac8dee9d4af97c02/NPCList_OSRS.json -o NPCList_OSRS.json
+$BIN spawn-index --database wiki.sqlite --mejrs-json NPCList_OSRS.json --mejrs-commit 6a3ca6f19d65c5609434b51cac8dee9d4af97c02
+```
+
+The source commit and file hash are recorded in `meta`. The upstream mejrs
+repository does not currently declare a license, so this project makes no
+license claim for imported rows. Some cache configs are genuinely unnamed, so
+mejrs rows can have an empty `name`; use their numeric ID for lookup.
+
 `equipment_items.requirement_status` distinguishes parsed requirements,
 explicitly requirement-free items, and unresolved Wiki prose.
 `equipment_requirements` stores typed requirement atoms with their context,

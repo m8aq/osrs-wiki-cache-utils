@@ -6,6 +6,7 @@ mod index;
 mod mcp;
 mod model;
 mod snapshot;
+mod spawns;
 
 use std::path::PathBuf;
 
@@ -13,7 +14,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use index::{
     SearchEngine, build_cache_index, build_code_index, build_equipment_index, build_index,
-    verify_cache_index, verify_code_index, verify_index,
+    build_spawn_index, verify_cache_index, verify_code_index, verify_index,
 };
 use mcp::OfflineWiki;
 use rmcp::{ServiceExt, transport::stdio};
@@ -51,6 +52,14 @@ enum Command {
     EquipmentIndex {
         #[arg(long)]
         database: PathBuf,
+    },
+    SpawnIndex {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long, requires = "mejrs_commit")]
+        mejrs_json: Option<PathBuf>,
+        #[arg(long, requires = "mejrs_json")]
+        mejrs_commit: Option<String>,
     },
     CacheIndex {
         #[arg(long)]
@@ -133,6 +142,18 @@ enum Command {
         kind: String,
         id: String,
     },
+    SpawnSearch {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long, value_parser = ["npc", "object", "item"])]
+        entity: String,
+        #[arg(long)]
+        id: Option<u32>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
     Verify {
         #[arg(long)]
         snapshot: Option<PathBuf>,
@@ -163,6 +184,18 @@ async fn main() -> Result<()> {
         }
         Command::Index { snapshot, database } => build_index(&snapshot, &database)?,
         Command::EquipmentIndex { database } => build_equipment_index(&database)?,
+        Command::SpawnIndex {
+            database,
+            mejrs_json,
+            mejrs_commit,
+        } => {
+            let (wiki, mejrs) =
+                build_spawn_index(&database, mejrs_json.as_deref(), mejrs_commit.as_deref())?;
+            eprintln!("spawn index complete: {wiki} Wiki rows");
+            if let Some(mejrs) = mejrs {
+                eprintln!("spawn index complete: {mejrs} mejrs rows");
+            }
+        }
         Command::CacheIndex {
             database,
             cache_dump,
@@ -255,6 +288,21 @@ async fn main() -> Result<()> {
         } => {
             let output = SearchEngine::open(&database, None, Some(&code_database))?
                 .code_entry(&kind, &id)?;
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        Command::SpawnSearch {
+            database,
+            entity,
+            id,
+            name,
+            limit,
+        } => {
+            let output = SearchEngine::open(&database, None, None)?.search_spawns(
+                &entity,
+                id,
+                name.as_deref(),
+                limit,
+            )?;
             println!("{}", serde_json::to_string_pretty(&output)?);
         }
         Command::Verify {
